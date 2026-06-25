@@ -16,3 +16,8 @@ shim:
   upstream-port: 8080
   paths:
     - /*
+gpus: 8
+models:
+  - name: ""
+    repo: ""
+    mpk: ""
