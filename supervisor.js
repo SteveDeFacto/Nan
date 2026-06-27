@@ -118,40 +118,44 @@ function releaseGpu(h) {
 const maxFreeVram    = () => Math.max(0, ...gpuCards.map(c => c.vramFree - CTX_OVERHEAD_GB));
 const maxFreeCompute = () => Math.max(0, ...gpuCards.map(c => c.computeFree));
 
-async function initGpu() {
-  // Discover real card UUIDs so each worker can be pinned (--gpus device=<uuid>).
-  // The supervisor image has no nvidia-smi, so enumerate via a one-shot container
-  // through the Docker API. Fast path: local nvidia-smi if it happens to exist.
-  // Resilient: on a CPU-only / mock box this no-ops and uuids stay null.
-  const apply = (text) => {
-    let got = 0;
-    for (const line of text.trim().split("\n")) {
-      const [idx, uuid, memMiB] = line.split(",").map(s => s.trim());
-      const i = parseInt(idx, 10);
-      if (gpuCards[i] && /^GPU-/.test(uuid || "")) {
-        gpuCards[i].uuid = uuid; got++;
-        const totalGb = parseFloat(memMiB) / 1024;
-        if (totalGb > 0) console.log(`[gpu] card ${i} ${uuid} (${totalGb.toFixed(0)}GB)`);
-      }
+// wait until the Docker Engine socket answers (it may not be ready at boot).
+async function waitForDocker(tries = 20, gapMs = 500) {
+  for (let i = 0; i < tries; i++) {
+    try { const r = await dockerReq("GET", "/version", null, 3000); if (r.status < 400) return true; } catch {}
+    await new Promise(r => setTimeout(r, gapMs));
+  }
+  return false;
+}
+
+const _applyGpu = (text) => {
+  let got = 0;
+  for (const line of text.trim().split("\n")) {
+    const [idx, uuid, memMiB] = line.split(",").map(s => s.trim());
+    const i = parseInt(idx, 10);
+    if (gpuCards[i] && /^GPU-/.test(uuid || "")) {
+      gpuCards[i].uuid = uuid; got++;
+      const totalGb = parseFloat(memMiB) / 1024;
+      if (totalGb > 0) console.log(`[gpu] card ${i} ${uuid} (${totalGb.toFixed(0)}GB)`);
     }
-    return got;
-  };
-  const QUERY = ["nvidia-smi", "--query-gpu=index,uuid,memory.total", "--format=csv,noheader,nounits"];
+  }
+  return got;
+};
+const GPU_QUERY = ["nvidia-smi", "--query-gpu=index,uuid,memory.total", "--format=csv,noheader,nounits"];
 
-  // fast path
-  try { const { stdout } = await pexec("nvidia-smi", QUERY.slice(1), { timeout: 8000 });
-        if (apply(stdout) >= GPU_COUNT) return; } catch {}
-
-  if (/^(1|true|on)$/i.test(process.env.MOCK_SPAWN || "")) { console.warn("[gpu] MOCK_SPAWN — skipping discovery"); return; }
-
-  // API path: run a throwaway CUDA container that prints the UUIDs
+// Discover card UUIDs (so workers can be pinned). Supervisor image has no
+// nvidia-smi, so enumerate via a one-shot CUDA container over the Docker API.
+async function discoverGpus() {
+  if (/^(1|true|on)$/i.test(process.env.MOCK_SPAWN || "")) return 0;
+  // fast path: local nvidia-smi if present
+  try { const { stdout } = await pexec("nvidia-smi", GPU_QUERY.slice(1), { timeout: 8000 });
+        const n = _applyGpu(stdout); if (n >= GPU_COUNT) return n; } catch {}
   const ref = process.env.GPU_SCAN_IMAGE || "nvidia/cuda:12.6.2-base-ubuntu24.04";
   const name = WORKER_PREFIX + "gpuscan";
   try {
     await dockerPull(ref);
     await dockerReq("DELETE", `/containers/${name}?force=1`).catch(() => {});
     const created = await dockerJson("POST", `/containers/create?name=${name}`, {
-      Image: ref, Cmd: QUERY,
+      Image: ref, Cmd: GPU_QUERY,
       HostConfig: { DeviceRequests: [{ Driver: "nvidia", Count: -1, Capabilities: [["gpu"]] }] },
     });
     const cid = created.Id;
@@ -159,11 +163,30 @@ async function initGpu() {
     await dockerReq("POST", `/containers/${cid}/wait`, null, 30000);
     const r = await dockerReq("GET", `/containers/${cid}/logs?stdout=1&stderr=1`);
     await dockerReq("DELETE", `/containers/${cid}?force=1`).catch(() => {});
-    const got = apply(demuxLogs(r.buf));
-    if (got < GPU_COUNT) console.warn(`[gpu] discovered ${got}/${GPU_COUNT} card UUIDs`);
+    return _applyGpu(demuxLogs(r.buf));
   } catch (e) {
     console.warn("[gpu] UUID discovery via docker failed:", e.message);
+    return 0;
   }
+}
+
+// Lazily ensure UUIDs are known before a GPU spawn — covers a boot-time socket
+// race where discovery ran before the Docker socket was ready.
+let _gpuDiscovering = null;
+async function ensureGpuUuids() {
+  if (gpuCards.every(c => c.uuid)) return true;
+  if (!_gpuDiscovering) _gpuDiscovering = (async () => { await waitForDocker(); return discoverGpus(); })()
+    .finally(() => { _gpuDiscovering = null; });
+  await _gpuDiscovering;
+  return gpuCards.some(c => c.uuid);
+}
+
+async function initGpu() {
+  // Best-effort at boot; the socket may not be up yet, so wait briefly. If it
+  // still fails, ensureGpuUuids() retries on the first spawn. Never blocks boot.
+  await waitForDocker();
+  const got = await discoverGpus();
+  if (got < GPU_COUNT) console.warn(`[gpu] boot discovery ${got}/${GPU_COUNT} — will retry on first spawn`);
 }
 
 async function initMps() {
@@ -329,6 +352,12 @@ async function spawnContainer({ deploymentId, owner, image, command, env, port, 
   const name = containerName(deploymentId);
   const appPort = parseInt(port, 10) || 8080;
   const ref = pinnedRef(image);
+
+  // boot may have raced the Docker socket and left UUIDs empty — resolve now.
+  if (gpu && !gpu.cardUuid) {
+    await ensureGpuUuids();
+    gpu.cardUuid = gpuCards[gpu.cardId]?.uuid || null;
+  }
 
   const Env = [];
   const HostConfig = {
