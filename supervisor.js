@@ -52,48 +52,67 @@ let SSH_HOST_KEY_FP   = "SHA256:<pending-boot>";
 
 function need(n){ const v = process.env[n]; if(!v){ console.error("FATAL: missing env", n); process.exit(1);} return v; }
 
-// ---- H200 MIG tiers --------------------------------------------------------
-// compute is in 1/7 SM-slice units, memory in ~17.6 GB slices, BUNDLED per
-// profile — not an independent dial. Confirm the exact set your card exposes
-// with `nvidia-smi mig -lgip`. Rate scales with the compute (SM) fraction.
-const CPU_RATE  = 0.0000306;  // USDC/sec, CPU-only ($0.11/hr)
-const FULL_RATE = 0.000972;   // USDC/sec, full H200 ($3.50/hr) — 7 compute slices OR 8 memory granules
-// Bill by the LARGER of compute share (g/7) or memory share (mem/8) of the GPU.
-// mem = ~17.6 GB granules: 18→1, 35→2, 71→4, 141→8.
-const _tier = (vramGb, g, mem) => ({ vramGb, g, mem, rate: FULL_RATE * Math.max(g / 7, mem / 8) });
-const MIG_TIERS = {
-  "1g.18gb":  _tier(18,  1, 1),   // compute-bound: 1/7  → $0.50/hr
-  "1g.35gb":  _tier(35,  1, 2),   // memory-bound:  2/8  → $0.87/hr (1/7 compute, double memory)
-  "2g.35gb":  _tier(35,  2, 2),   // compute-bound: 2/7  → $1.00/hr
-  "3g.71gb":  _tier(71,  3, 4),   // memory-bound:  4/8  → $1.75/hr
-  "4g.71gb":  _tier(71,  4, 4),   // compute-bound: 4/7  → $2.00/hr
-  "7g.141gb": _tier(141, 7, 8),   // whole GPU           → $3.50/hr
-};
-// The fixed partition this GPU is carved into (must fit 7 SM + 8 mem slices; no
-// live re-partition while busy). Default: sliced 7 ways — six 18 GB tenants + one
-// instance (1g.35gb) soaks up the 8th memory granule that 7x1g.18gb would strand,
-// so all 7 compute + 8 memory slices are used. Override via MIG_LAYOUT (CSV).
-const MIG_LAYOUT = (process.env.MIG_LAYOUT || "1g.18gb,1g.18gb,1g.18gb,1g.18gb,1g.18gb,1g.18gb,1g.35gb")
-  .split(",").map(s => s.trim()).filter(Boolean);
+// ---- GPU resource model: ARBITRARY splitting ------------------------------
+// CC disables MIG, so the card is ONE trust domain and we slice it in SOFTWARE:
+// every deployment is a per-tenant worker PROCESS with (a) a VRAM cap and (b) a
+// compute (throughput) share. Any split is allowed at GRANULARITY_GB, as long as
+// the per-card sums fit. Isolation comes from the process boundary, not the slice
+// size (separate GPU address spaces; VRAM scrubbed by the driver on worker exit).
+const CPU_RATE        = 0.0000306;                                      // USDC/sec, CPU-only ($0.11/hr)
+const FULL_RATE       = 0.0016667;                                      // USDC/sec, a WHOLE card ($6.00/hr)
+const GPU_COUNT       = parseInt(process.env.GPU_COUNT || "1", 10);     // cards in this enclave
+const CARD_VRAM_GB    = parseFloat(process.env.GPU_VRAM_GB || "141");   // usable VRAM per card
+const CTX_OVERHEAD_GB = parseFloat(process.env.CTX_OVERHEAD_GB || "0.5"); // per-worker context cost, reserved on top of the cap
+const MIN_COMPUTE_SHARE = parseFloat(process.env.MIN_COMPUTE_SHARE || "0.1428571"); // default/floor compute share (1/7)
+const GRANULARITY_GB  = parseFloat(process.env.VRAM_GRANULARITY_GB || "1"); // request rounding; 1 GB ≈ arbitrary
 
-// instance pool — uuid is the real MIG device, discovered at boot (see initMig)
-const migPool = MIG_LAYOUT.map((profile, i) => {
-  const t = MIG_TIERS[profile];
-  if (!t) { console.error("FATAL: unknown MIG profile in MIG_LAYOUT:", profile); process.exit(1); }
-  return { slot: i, profile, vramGb: t.vramGb, rate: t.rate, uuid: null, busy: false };
-});
-function allocMig(vramGb) {
-  // smallest free instance whose memory satisfies the request (round UP)
-  const fit = migPool.filter(m => !m.busy && m.vramGb >= vramGb).sort((a, b) => a.vramGb - b.vramGb);
-  return fit[0] || null;
+const round1 = (x) => Math.round(x * 10) / 10;
+const round3 = (x) => Math.round(x * 1000) / 1000;
+const memShareOf = (vramGb) => vramGb / CARD_VRAM_GB;
+
+// per-card free pools (vram + compute). With CC on there is exactly one whole
+// device per card — no MIG instances to enumerate.
+const gpuCards = Array.from({ length: GPU_COUNT }, (_, i) => ({ id: i, uuid: null, vramFree: CARD_VRAM_GB, computeFree: 1 }));
+
+// price = whole-card rate × the LARGER of memory share or compute share.
+function rateFor(vramGb, computeShare) {
+  if (!(vramGb > 0)) return CPU_RATE;
+  return FULL_RATE * Math.max(memShareOf(vramGb), computeShare);
 }
-const maxVram = () => Math.max(0, ...migPool.map(m => m.vramGb));
+// normalize a request: round VRAM up to granularity; default/clamp compute share.
+function normalizeReq(vramGb, computeShare) {
+  const v = Math.ceil(vramGb / GRANULARITY_GB) * GRANULARITY_GB;
+  let c = (computeShare == null) ? Math.max(MIN_COMPUTE_SHARE, memShareOf(v)) : computeShare;
+  c = Math.min(1, Math.max(0, c));
+  return { vramGb: v, computeShare: c };
+}
+// reserve an arbitrary slice on a single card (best-fit on VRAM). Overhead is
+// reserved on top of the cap so the sum of live workers never exceeds physical.
+function allocGpu(vramGb, computeShare) {
+  const needV = vramGb + CTX_OVERHEAD_GB;
+  const fit = gpuCards
+    .filter(c => c.vramFree >= needV - 1e-9 && c.computeFree >= computeShare - 1e-9)
+    .sort((a, b) => (a.vramFree - needV) - (b.vramFree - needV));
+  const card = fit[0];
+  if (!card) return null;
+  card.vramFree -= needV; card.computeFree -= computeShare;
+  return { cardId: card.id, vramGb, computeShare, _needV: needV };
+}
+function releaseGpu(h) {
+  if (!h) return;
+  const card = gpuCards[h.cardId]; if (!card) return;
+  card.vramFree = Math.min(CARD_VRAM_GB, card.vramFree + h._needV);
+  card.computeFree = Math.min(1, card.computeFree + h.computeShare);
+}
+// largest slice a single card can still take (VRAM net of overhead; compute share)
+const maxFreeVram    = () => Math.max(0, ...gpuCards.map(c => c.vramFree - CTX_OVERHEAD_GB));
+const maxFreeCompute = () => Math.max(0, ...gpuCards.map(c => c.computeFree));
 
-async function initMig() {
-  // TODO: parse `nvidia-smi -L` for MIG device UUIDs and match them to MIG_LAYOUT
-  // by profile, setting migPool[i].uuid = "MIG-xxxxxxxx-...". Pass that uuid to
-  // the container as NVIDIA_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES on spawn.
-  // (If Tinfoil pre-partitions and injects MIG_UUIDS, read them from env here.)
+async function initGpu() {
+  // TODO: discover card UUIDs (`nvidia-smi -L`) → gpuCards[i].uuid, so each worker
+  // can be pinned with CUDA_VISIBLE_DEVICES=<uuid>. Optionally read true usable
+  // VRAM (`nvidia-smi --query-gpu=memory.total`) to set CARD_VRAM_GB. With CC on,
+  // each card is one whole device — there are no MIG instances to list.
 }
 
 async function initSshHostKey() {
@@ -161,31 +180,49 @@ function sshAccessOf(rec) {
 //     `authorizedKey`, and sets a ForceCommand that exec's into THIS sandbox's
 //     namespace. Return its loopback port as sshPort.
 // ============================================================================
-async function spawnContainer({ deploymentId, owner, image, command, env, port, migUuid, budget, authorizedKey }) {
-  // TODO: launch image.reference (pinned by image.digest) — any stock image —
-  // isolated to ONE app port, bound to the MIG instance:
-  // NVIDIA_VISIBLE_DEVICES=migUuid (null => CPU-only).
-  // Then start a loopback sshd for this deployment:
+async function spawnContainer({ deploymentId, owner, image, command, env, port, gpu, budget, authorizedKey }) {
+  // MOCK mode: no real CVM launch yet — return fake ports so the WHOLE control
+  // plane (auth, pricing, availability, deployment CRUD, billing) works end-to-end
+  // while spawn/stop/measure are still stubs. Set MOCK_SPAWN=1 to enable.
+  if (/^(1|true|on)$/i.test(process.env.MOCK_SPAWN || "")) {
+    console.log(`[mock] spawn ${deploymentId} image=${image?.reference} gpu=${gpu ? gpu.vramCapGb + "GB@" + gpu.computeShare : "cpu"}`);
+    return { internalPort: port || 8080, sshPort: 0 };
+  }
+  // TODO: launch image.reference (pinned by image.digest) as this tenant's OWN
+  // worker PROCESS — never shared with another tenant. If gpu != null:
+  //   • pin the card:        CUDA_VISIBLE_DEVICES = gpu.cardUuid
+  //   • cap VRAM:            enforce gpu.vramCapGb in the worker's allocator
+  //                          (reject allocs past the cap; the supervisor already
+  //                          reserved gpu.vramCapGb + overhead against the card)
+  //   • cap compute:         run under MPS with
+  //                          CUDA_MPS_ACTIVE_THREAD_PERCENTAGE = round(gpu.computeShare*100)
+  // Isolation is the process boundary; rotating a tenant = killing this process
+  // (the driver scrubs its VRAM on exit). Then start the loopback sshd:
   //   -h ${SSH_HOST_KEY_PATH}            (the measured, boot-generated host key)
-  //   authorized_keys = authorizedKey    (the user's / generated public key)
-  //   ForceCommand = exec into this sandbox's namespace as ${SSH_USER}
-  // return { internalPort, sshPort };  // sshPort = that loopback sshd, reached only via the /x/:id/ssh tunnel
+  //   authorized_keys = authorizedKey
+  //   ForceCommand = exec into this worker's namespace as ${SSH_USER}
+  // return { internalPort, sshPort };
   throw new Error("spawnContainer() not implemented — wire to your CVM runtime");
 }
-async function stopContainer(rec)  { /* TODO: kill the sandbox; the MIG slot is freed in the route */ }
+async function stopContainer(rec)  { /* TODO: SIGKILL the worker; its VRAM is scrubbed on exit and the slice is freed in the route */ }
 async function getMeasurements(rec) {
-  // TODO: return the live TDX quote (+ per-MIG-instance GPU report) folding in image.digest.
+  // TODO: return the live TDX quote (+ whole-card NVIDIA CC report) folding in image.digest.
   return {
     tlsKeyFingerprint: "sha256:<enclave-tls-pubkey-hash>",
     sshHostKeyFingerprint: SSH_HOST_KEY_FP, // boot-generated; measured into an RTMR (see initSshHostKey TODO)
     vm:  { technology: "intel-tdx", quote: "<base64 tdx quote>", measurements: { rtmr3: rec.digest }, verified: true },
-    gpu: (rec.resources && rec.resources.migProfile) ? { technology: "nvidia-cc", migProfile: rec.resources.migProfile, report: "<base64 nvidia report>", verified: true } : null,
+    gpu: rec._gpu ? { technology: "nvidia-cc", ccMode: "on", vramCapGb: rec.resources.vramGb,
+                      computeShare: rec.resources.computeShare, report: "<base64 nvidia report>", verified: true } : null,
   };
 }
 function capacity() {
-  const tiers = {}; // vramGb -> free count
-  for (const m of migPool) if (!m.busy) tiers[m.vramGb] = (tiers[m.vramGb] || 0) + 1;
-  return { cpu: 64, gpuFreeByVram: tiers, gpuFree: migPool.filter(m => !m.busy).length };
+  return {
+    cpu: 64,
+    gpu: gpuCards.map(c => ({ id: c.id, vramFreeGb: round1(c.vramFree), computeFree: round3(c.computeFree) })),
+    vramFreeGb: round1(gpuCards.reduce((s, c) => s + c.vramFree, 0)),
+    maxVramGb: round1(maxFreeVram()),
+    maxComputeShare: round3(maxFreeCompute()),
+  };
 }
 // ============================================================================
 
@@ -244,13 +281,18 @@ app.get("/v1/version", (_req, res) => res.json({ service: "nan-supervisor/0.1.0"
 
 app.get("/v1/pricing", (_req, res) => res.json({
   assets: ["ETH","USDC"],
-  model: "Request VRAM; you get the smallest MIG profile that fits. Billed by the LARGER of your compute share (n/7 of the SMs) or memory share (n/8 of HBM) of the GPU.",
+  model: "Request any VRAM slice (GB) and an optional compute share (0–1) of a card. Both are software-enforced caps — CC disables MIG, so splits are arbitrary, not fixed profiles. Billed per second by the LARGER of memory share (vramGb / cardVramGb) or compute share, times the whole-card rate.",
+  card: { vramGb: CARD_VRAM_GB, count: GPU_COUNT,
+          wholeCardPerSecondUsdc: FULL_RATE.toFixed(7), wholeCardPerHourUsdc: (FULL_RATE * 3600).toFixed(2) },
   cpu: { ratePerSecondUsdc: CPU_RATE.toFixed(7), ratePerHourUsdc: (CPU_RATE * 3600).toFixed(2) },
-  gpuTiers: [...new Set(migPool.map(m => m.profile))].map(profile => {
-    const t = MIG_TIERS[profile];
-    return { profile, vramGb: t.vramGb, computeFraction: `${t.g}/7`, memoryFraction: `${t.mem}/8`,
-             billedOn: (t.mem / 8 > t.g / 7) ? "memory" : "compute",
-             ratePerSecondUsdc: t.rate.toFixed(7), ratePerHourUsdc: (t.rate * 3600).toFixed(2) };
+  minComputeShare: round3(MIN_COMPUTE_SHARE),
+  vramGranularityGb: GRANULARITY_GB,
+  formula: "ratePerSecondUsdc = wholeCardPerSecond × max(vramGb / cardVramGb, computeShare)",
+  examples: [18, 35, 70, 141].map(v => {
+    const s = normalizeReq(v, null), r = rateFor(s.vramGb, s.computeShare);
+    return { vramGb: s.vramGb, computeShare: round3(s.computeShare),
+             billedOn: memShareOf(s.vramGb) >= s.computeShare ? "memory" : "compute",
+             ratePerSecondUsdc: r.toFixed(7), ratePerHourUsdc: (r * 3600).toFixed(2) };
   }),
   billingIncrementSeconds: 1,
 }));
@@ -259,8 +301,11 @@ app.get("/availability", (_req, res) => {
   const c = capacity();
   res.json({
     cpu: { available: c.cpu, status: "available" },
-    gpuByVram: Object.entries(c.gpuFreeByVram).map(([vramGb, n]) => ({ vramGb: Number(vramGb), available: n })),
-    gpuFree: c.gpuFree, maxVramGb: maxVram(),
+    gpu: c.gpu,
+    vramFreeGb: c.vramFreeGb,
+    maxVramGb: c.maxVramGb,
+    maxComputeShare: c.maxComputeShare,
+    cardVramGb: CARD_VRAM_GB, cards: GPU_COUNT,
     updatedAt: new Date().toISOString(),
   });
 });
@@ -334,7 +379,7 @@ const spentOf = (rec) => {
   const raw = ((Date.now() - rec.startedAt) / 1000) * (rec.rate || 0);
   return Math.min(raw, cap).toFixed(2);
 };
-const view = (rec) => { const o = { ...rec }; delete o._port; delete o._mig; delete o.rate;
+const view = (rec) => { const o = { ...rec }; delete o._port; delete o._gpu; delete o.rate;
                         delete o._sshPort; delete o._sshKeySource; delete o._authorizedKey;
                         o.ssh = sshAccessOf(rec);
                         o.budget = { ...rec.budget, spent: spentOf(rec) }; return o; };
@@ -346,18 +391,24 @@ app.post("/v1/deployments", authed, async (req, res) => {
   const appPort = Number(b.port) || 8080;
   if (b.sshPublicKey != null && !/^(ssh-ed25519|ssh-rsa|ecdsa-sha2-|sk-ssh-|sk-ecdsa-)/.test(String(b.sshPublicKey).trim()))
     return fail(res, 422, "invalid_spec", "sshPublicKey must be an OpenSSH public key (ssh-ed25519 / ssh-rsa / ecdsa / sk-*).");
-  const vramGb = Number((b.resources && b.resources.vramGb) || 0);
-  if (!(vramGb >= 0) || vramGb > 1024) return fail(res, 422, "invalid_spec", "resources.vramGb out of range.");
+  const vramGb0 = Number((b.resources && b.resources.vramGb) || 0);
+  if (!(vramGb0 >= 0) || vramGb0 > 100000) return fail(res, 422, "invalid_spec", "resources.vramGb out of range.");
+  let computeShare0 = (b.resources && b.resources.computeShare != null) ? Number(b.resources.computeShare) : null;
+  if (computeShare0 != null && !(computeShare0 > 0 && computeShare0 <= 1))
+    return fail(res, 422, "invalid_spec", "resources.computeShare must be in (0, 1].");
 
-  // allocate a MIG instance sized to the requested VRAM (0 => CPU-only)
-  let mig = null, rate = CPU_RATE;
-  if (vramGb > 0) {
-    if (vramGb > maxVram()) return fail(res, 422, "invalid_spec", `requested ${vramGb}GB exceeds largest slice (${maxVram()}GB).`);
-    mig = allocMig(vramGb);
-    if (!mig) return fail(res, 409, "no_capacity", `No free GPU slice >= ${vramGb}GB.`);
-    mig.busy = true; rate = mig.rate;
+  // allocate an ARBITRARY GPU slice (vramGb + compute share); 0 VRAM => CPU-only
+  let gpu = null, rate = CPU_RATE, slice = null;
+  if (vramGb0 > 0) {
+    slice = normalizeReq(vramGb0, computeShare0);
+    if (slice.vramGb > maxFreeVram() + 1e-9)
+      return fail(res, 422, "invalid_spec", `requested ${slice.vramGb}GB VRAM exceeds the largest free slice (${round1(maxFreeVram())}GB on a ${CARD_VRAM_GB}GB card).`);
+    gpu = allocGpu(slice.vramGb, slice.computeShare);
+    if (!gpu) return fail(res, 409, "no_capacity",
+      `No single card has ${slice.vramGb}GB VRAM and ${round3(slice.computeShare)} compute share free together (max free: ${round1(maxFreeVram())}GB, ${round3(maxFreeCompute())} share).`);
+    rate = rateFor(slice.vramGb, slice.computeShare);
   }
-  const release = () => { if (mig) mig.busy = false; };
+  const release = () => { if (gpu) { releaseGpu(gpu); gpu = null; } };
 
   try {
     const bal = await readEscrow(req.address);
@@ -376,7 +427,9 @@ app.post("/v1/deployments", authed, async (req, res) => {
   const id = rid("dep_");
   let internalPort, sshPort;
   try { ({ internalPort, sshPort } = await spawnContainer({ deploymentId: id, owner: req.address, image,
-            command: b.command || [], env: b.env || {}, port: appPort, migUuid: mig ? mig.uuid : null,
+            command: b.command || [], env: b.env || {}, port: appPort,
+            gpu: gpu ? { cardId: gpu.cardId, cardUuid: gpuCards[gpu.cardId]?.uuid || null,
+                         vramCapGb: gpu.vramGb, computeShare: gpu.computeShare } : null,
             budget: b.budget, authorizedKey })); }
   catch (e) { release(); return fail(res, 502, "enclave_error", e.message); }
 
@@ -384,13 +437,14 @@ app.post("/v1/deployments", authed, async (req, res) => {
   const rec = {
     id, owner: req.address, status: "running",
     image, command: b.command || [],
-    resources: { vramGb: mig ? mig.vramGb : 0, migProfile: mig ? mig.profile : null },
+    resources: gpu ? { vramGb: slice.vramGb, computeShare: round3(slice.computeShare), cardId: gpu.cardId }
+                   : { vramGb: 0 },
     network: { port: appPort, protocol: "https", endpoint: `${originOf(req)}/x/${id}` },
     budget: { asset: b.budget.asset, limit: b.budget.limit, spent: "0.00", ratePerSecond: rate.toFixed(7) },
-    attestation: { available: true, vmTechnology: "intel-tdx", gpuTechnology: mig ? "nvidia-cc" : null,
+    attestation: { available: true, vmTechnology: "intel-tdx", gpuTechnology: gpu ? "nvidia-cc" : null,
                    href: `/v1/deployments/${id}/attestation` },
     region: "tinfoil", createdAt: now, startedAt: Date.now(), expiresAt: null,
-    digest: image.digest || null, rate, _mig: mig, _port: internalPort,
+    digest: image.digest || null, rate, _gpu: gpu, _port: internalPort,
     _sshPort: sshPort, _sshKeySource: keySource, _authorizedKey: authorizedKey,
   };
   deployments.set(id, rec);
@@ -413,7 +467,7 @@ app.delete("/v1/deployments/:id", authed, async (req, res) => {
   const rec = deployments.get(req.params.id);
   if (!rec || rec.owner !== req.address) return fail(res, 404, "not_found", "No such deployment.");
   try { await stopContainer(rec); } catch {}
-  if (rec._mig) { rec._mig.busy = false; rec._mig = null; } // return the MIG slice to the pool
+  if (rec._gpu) { releaseGpu(rec._gpu); rec._gpu = null; } // return the slice (vram + compute) to the card
   const settled = spentOf(rec); rec.status = "stopping";
   res.json({ id: rec.id, status: "stopping",
              settled:  { asset: rec.budget.asset, amount: settled },
@@ -428,7 +482,7 @@ app.get("/v1/deployments/:id/attestation", authed, async (req, res) => {
 });
 
 app.use((_req, res) => fail(res, 404, "not_found", "No such route."));
-await initMig();
+await initGpu();
 await initSshHostKey();
 
 // ---------------------------------------------------------------------------
@@ -474,4 +528,4 @@ server.on("upgrade", async (req, socket, head) => {
   });
 });
 
-server.listen(PORT, () => console.log(`nan supervisor on :${PORT} · MIG slots: ${migPool.map(m => m.profile).join(", ") || "none"} · ssh host key ${SSH_HOST_KEY_FP}`));
+server.listen(PORT, () => console.log(`nan supervisor on :${PORT} · ${GPU_COUNT}×GPU @ ${CARD_VRAM_GB}GB (arbitrary split) · ssh host key ${SSH_HOST_KEY_FP}`));
