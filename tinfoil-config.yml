@@ -32,7 +32,6 @@ containers:
       - VRAM_GRANULARITY_GB: "1"
       - CTX_OVERHEAD_GB: "0.5"
       - SSH_USER: "instance"
-      - MOCK_SPAWN: "1"
       - DEFAULT_IMAGE: "debian:bookworm-slim"   # any stock image; sshd is hosted by the supervisor
       # SSH host-key fingerprint is generated at boot in-enclave and measured into an RTMR — not configured here.
     secrets:
