@@ -39,7 +39,7 @@ containers:
 
   # --- GPU worker: forks MPS-capped CUDA processes per tenant, runs submitted jobs
   - name: "worker"
-    image: "ghcr.io/stevedefacto/nan-worker@sha256:b6ea048019f1d9154891d23b8a1f1f518a1d6529c7ea41ed88b024a99946c3ea"
+    image: "ghcr.io/stevedefacto/nan-worker@sha256:584b9bf3011efd96f291b4e3a03be624d731f827335a52713cdad3313953087f"
     runtime: nvidia
     gpus: all
     ipc: host
@@ -59,7 +59,7 @@ containers:
 
   # --- supervisor: control plane (no GPU), public ingress -----------------------
   - name: "supervisor"
-    image: "ghcr.io/stevedefacto/nan:sha256@73c7951972fe1e16d6a01394d20540fec091addb5a2d09835ebd80475beebb58"
+    image: "ghcr.io/stevedefacto/nan:sha256:c377358456034e3840778250db8c24a6c20dd3a9689f799ab0bd07470135124d"
     restart: always
     env:
       - PORT: "8080"
