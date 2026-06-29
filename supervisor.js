@@ -53,6 +53,31 @@ const WORKER_PREFIX  = process.env.WORKER_PREFIX || "nan_";
 const SPAWN_TIMEOUT_MS = parseInt(process.env.SPAWN_TIMEOUT_MS || "180000", 10); // includes image pull
 const WORKER_MEM      = process.env.WORKER_MEM || "16g";                // host-RAM cap per worker (not GPU)
 const WORKER_PIDS     = process.env.WORKER_PIDS || "512";
+// ---- worker MANAGER (Layer 2/3) --------------------------------------------
+// The GPU container runs a manager that forks one MPS-capped CHILD PROCESS per
+// tenant. The supervisor routes deploys/submissions HERE instead of creating
+// containers itself (Tinfoil forbids runtime container creation). Reachable over
+// the enclave-local network; default loopback.
+const WORKER_MGR_URL  = (process.env.WORKER_MGR_URL || "http://127.0.0.1:8090").replace(/\/+$/, "");
+function mgrReq(method, path, body, timeoutMs = 120000) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(WORKER_MGR_URL + path);
+    const data = body != null ? Buffer.from(JSON.stringify(body)) : null;
+    const r = http.request(
+      { host: u.hostname, port: u.port || 80, path: u.pathname + u.search, method, timeout: timeoutMs,
+        headers: { "Content-Type": "application/json", ...(data ? { "Content-Length": data.length } : {}) } },
+      (res) => { let buf = ""; res.on("data", (c) => (buf += c));
+                 res.on("end", () => { let j; try { j = JSON.parse(buf || "{}"); } catch { j = { raw: buf }; }
+                                       resolve({ status: res.statusCode || 0, body: j }); }); });
+    r.on("error", reject); r.on("timeout", () => r.destroy(new Error("manager timeout")));
+    if (data) r.write(data); r.end();
+  });
+}
+async function mgrHealth(timeoutMs = 3000) {
+  const r = await mgrReq("GET", "/health", null, timeoutMs);
+  if (r.status !== 200) throw new Error(`manager /health ${r.status}`);
+  return r.body;
+}
 // The sandbox sshd host key is GENERATED ONCE AT BOOT inside the enclave and
 // measured into a TDX RTMR (see initSshHostKey) — so its fingerprint is
 // attestation-bound without baking a key into any image, and one fingerprint
@@ -348,80 +373,35 @@ async function dockerPull(ref) {
   if (err) throw new Error(`pull ${ref}: ${err.error}`);
 }
 
-async function spawnContainer({ deploymentId, owner, image, command, env, port, gpu, budget, authorizedKey }) {
-  // MOCK mode: no real launch — fake ports so the control plane works end-to-end.
+async function spawnContainer({ deploymentId, gpu }) {
+  // The supervisor no longer creates containers. It asks the worker MANAGER to
+  // fork one MPS-capped child PROCESS for this tenant. One proportional `share`
+  // (matching the frontend's single dial) sets the cap; the manager returns the
+  // SM count the driver granted the child — the hardware-enforced proof.
+  const shareOf = (g) => Math.min(1, Math.max(MIN_COMPUTE_PCT / 100,
+                                              g.vramCapGb / CARD_VRAM_GB, g.computeShare));
   if (/^(1|true|on)$/i.test(process.env.MOCK_SPAWN || "")) {
-    console.log(`[mock] spawn ${deploymentId} image=${image?.reference} gpu=${gpu ? gpu.vramCapGb + "GB@" + gpu.computeShare : "cpu"}`);
-    return { internalPort: port || 8080, sshPort: 0 };
+    console.log(`[mock] tenant ${deploymentId} share=${gpu ? shareOf(gpu).toFixed(3) : "cpu"}`);
+    return { internalPort: 0, sshPort: 0 };
   }
-
-  const name = containerName(deploymentId);
-  const appPort = parseInt(port, 10) || 8080;
-  const ref = pinnedRef(image);
-
-  // boot may have raced the Docker socket and left UUIDs empty — resolve now.
-  if (gpu && !gpu.cardUuid) {
-    await ensureGpuUuids();
-    gpu.cardUuid = gpuCards[gpu.cardId]?.uuid || null;
-  }
-
-  const Env = [];
-  const HostConfig = {
-    Memory: toBytes(WORKER_MEM), PidsLimit: parseInt(WORKER_PIDS, 10),
-    SecurityOpt: ["no-new-privileges"], CapDrop: ["ALL"], RestartPolicy: { Name: "no" },
-    // ephemeral host port, bound to LOOPBACK — only the /x/:id proxy can reach it
-    PortBindings: { [`${appPort}/tcp`]: [{ HostIp: "127.0.0.1", HostPort: "" }] },
-  };
-
-  if (gpu && gpu.cardUuid) {
-    const smPct = Math.max(1, Math.min(100, Math.round(gpu.computeShare * 100)));
-    const vramG = Math.max(1, Math.ceil(gpu.vramCapGb));
-    Env.push(`NVIDIA_VISIBLE_DEVICES=${gpu.cardUuid}`, `CUDA_VISIBLE_DEVICES=0`);
-    HostConfig.DeviceRequests = [{ Driver: "nvidia", DeviceIDs: [gpu.cardUuid], Capabilities: [["gpu"]] }]; // == --gpus device=<uuid>
-    if (ENABLE_MPS) {
-      Env.push(`CUDA_MPS_PIPE_DIRECTORY=${MPS_PIPE_DIR}`,
-               `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=${smPct}`,   // SM cap   (enforced under CC)
-               `CUDA_MPS_PINNED_DEVICE_MEM_LIMIT=0=${vramG}G`); // VRAM cap (enforced under CC)
-      HostConfig.Binds = [`${MPS_PIPE_DIR}:${MPS_PIPE_DIR}`];   // join the host MPS daemon
-    }
-  } else if (gpu && !gpu.cardUuid) {
-    throw new Error("GPU requested but card UUID unknown (GPU discovery failed at boot)");
-  }
-
-  for (const [k, v] of Object.entries(env || {}))
-    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) Env.push(`${k}=${String(v)}`);
-
-  const body = { Image: ref, Env, ExposedPorts: { [`${appPort}/tcp`]: {} }, HostConfig };
-  if (Array.isArray(command) && command.length) body.Cmd = command.map(String);
-
-  await dockerPull(ref);                                                   // pull (bounded)
-  await dockerReq("DELETE", `/containers/${name}?force=1`).catch(() => {}); // clear any stale name
-  let cid;
-  try {
-    const created = await dockerJson("POST", `/containers/create?name=${encodeURIComponent(name)}`, body);
-    cid = created.Id;
-    await dockerJson("POST", `/containers/${cid}/start`);
-  } catch (e) {
-    await dockerReq("DELETE", `/containers/${name}?force=1`).catch(() => {});
-    throw new Error(`worker launch failed: ${e.message}`);
-  }
-
-  // read back the loopback host port docker assigned
-  let internalPort = 0;
-  try {
-    const insp = await dockerJson("GET", `/containers/${cid}/json`);
-    internalPort = parseInt(insp?.NetworkSettings?.Ports?.[`${appPort}/tcp`]?.[0]?.HostPort || "0", 10);
-  } catch { /* headless/batch worker may expose no port */ }
-
-  console.log(`[spawn] ${name} cid=${cid.slice(0,12)} card=${gpu?.cardUuid || "cpu"} sm=${gpu ? Math.round(gpu.computeShare*100)+"%" : "-"} vram=${gpu ? Math.ceil(gpu.vramCapGb)+"G" : "-"} -> 127.0.0.1:${internalPort}`);
-  return { internalPort, sshPort: 0 };
+  if (!gpu) throw new Error("CPU-only deployments are not supported (a GPU share is required).");
+  const share = shareOf(gpu);
+  const r = await mgrReq("POST", "/tenants", { id: deploymentId, share }, SPAWN_TIMEOUT_MS);
+  if (r.status !== 201 || r.body.status !== "running")
+    throw new Error(`worker manager: ${r.body.error || r.body.status || r.status} `
+                  + `(sm_granted=${r.body.sm_granted ?? "?"})`);
+  console.log(`[spawn] tenant=${deploymentId} share=${share.toFixed(3)} `
+            + `sm_granted=${r.body.sm_granted} device=${r.body.device}`);
+  // _port is unused in the submission model (the data path routes by tenant id).
+  return { internalPort: 0, sshPort: 0, smGranted: r.body.sm_granted };
 }
 
 async function stopContainer(rec) {
-  // force-remove (SIGKILL + rm). VRAM is scrubbed by the driver on process exit
-  // (confirmed); releaseGpu() returns the slice to the card in the route.
-  const name = containerName(rec.id);
-  await dockerReq("DELETE", `/containers/${name}?force=1`).catch((e) => console.warn(`[stop] ${name}: ${e.message}`));
+  // Tear down the tenant's MPS-capped child. The manager terminates the process,
+  // which returns its context/VRAM to the driver and releases the share. NOTE:
+  // freed VRAM is not zeroed here — residual-data scrubbing is Layer 4.
+  await mgrReq("DELETE", `/tenants/${encodeURIComponent(rec.id)}`)
+    .catch((e) => console.warn(`[stop] ${rec.id}: ${e.message}`));
 }
 async function getMeasurements(rec) {
   // TODO: return the live TDX quote (+ whole-card NVIDIA CC report) folding in image.digest.
@@ -471,17 +451,22 @@ async function addrFromAuth(req) {
 // ---------------------------------------------------------------------------
 app.use("/x/:id", async (req, res) => {
   const rec = deployments.get(req.params.id);
-  if (!rec || !rec._port) return fail(res, 404, "not_found", "Unknown deployment.");
+  if (!rec) return fail(res, 404, "not_found", "Unknown deployment.");
   const addr = await addrFromAuth(req);
   if (!addr) return fail(res, 401, "unauthorized", "Missing or invalid token.");
   if (rec.owner !== addr) return fail(res, 403, "forbidden", "Not your deployment.");
   if (rec.status !== "running") return fail(res, 409, "not_running", `Deployment is ${rec.status}.`);
 
-  const headers = { ...req.headers, host: `127.0.0.1:${rec._port}` };
-  delete headers.authorization; // the NAN token stays at the supervisor; container never sees it
-  const up = http.request({ host: "127.0.0.1", port: rec._port, method: req.method, path: req.url, headers }, (upRes) => {
-    res.writeHead(upRes.statusCode || 502, upRes.headers); upRes.pipe(res);
-  });
+  // Submission model: /x/:id/<sub> -> worker manager /tenants/:id/<sub>
+  // (e.g. POST /x/:id/run carries the PTX job). The tenant id == deployment id.
+  const sub = req.url.replace(/^\/+/, "");
+  const target = new URL(`${WORKER_MGR_URL}/tenants/${encodeURIComponent(req.params.id)}/${sub}`);
+  const headers = { ...req.headers, host: target.host };
+  delete headers.authorization; // the NAN token stays at the supervisor; the worker never sees it
+  const up = http.request(
+    { host: target.hostname, port: target.port || 80, method: req.method,
+      path: target.pathname + target.search, headers },
+    (upRes) => { res.writeHead(upRes.statusCode || 502, upRes.headers); upRes.pipe(res); });
   up.on("error", (e) => { if (!res.headersSent) res.writeHead(502); res.end("upstream error: " + e.message); });
   req.pipe(up);
 });
@@ -518,17 +503,40 @@ app.get("/v1/pricing", (_req, res) => res.json({
   billingIncrementSeconds: 1,
 }));
 
-app.get("/availability", (_req, res) => {
-  const c = capacity();
-  res.json({
-    cpu: { available: c.cpu, status: "available" },
-    gpu: c.gpu,
-    vramFreeGb: c.vramFreeGb,
-    maxVramGb: c.maxVramGb,
-    maxComputeShare: c.maxComputeShare,
-    cardVramGb: CARD_VRAM_GB, cards: GPU_COUNT,
-    updatedAt: new Date().toISOString(),
-  });
+app.get("/availability", async (_req, res) => {
+  // Live from the worker manager (the real allocator). Emits `share`-model fields
+  // (what the frontend reads); falls back to local accounting if it's unreachable.
+  try {
+    const c = (await mgrHealth()).capacity;
+    return res.json({
+      maxShare: c.maxShare, usedShare: c.usedShare,
+      smFree: c.smFree, smTotal: SM_TOTAL,
+      vramFreeGb: c.vramFreeGb, cardVramGb: CARD_VRAM_GB, cards: GPU_COUNT,
+      source: "worker", updatedAt: new Date().toISOString(),
+    });
+  } catch (e) {
+    const c = capacity();
+    return res.json({
+      maxShare: c.maxComputeShare, usedShare: round3(1 - c.maxComputeShare),
+      smFree: Math.round(c.maxComputeShare * SM_TOTAL), smTotal: SM_TOTAL,
+      vramFreeGb: c.vramFreeGb, cardVramGb: CARD_VRAM_GB, cards: GPU_COUNT,
+      source: "fallback", note: "worker manager unreachable", updatedAt: new Date().toISOString(),
+    });
+  }
+});
+
+// External proof that MPS caps are live: each running tenant's granted SM count
+// (sanitized — no tenant ids). A 25% tenant should report ~33 of 132 SMs.
+app.get("/v1/gpu", async (_req, res) => {
+  try {
+    const h = await mgrHealth(5000);
+    res.json({
+      ok: true, role: h.role, mpsActive: !!h.mps_pipe, capacity: h.capacity, smTotal: SM_TOTAL,
+      tenants: (h.tenants || []).map((t) => ({ pct: t.pct, status: t.status, smGranted: t.sm_granted })),
+    });
+  } catch (e) {
+    res.status(503).json({ ok: false, error: `worker manager unreachable: ${e.message}` });
+  }
 });
 
 // ============================================================================
