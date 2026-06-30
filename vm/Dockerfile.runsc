@@ -16,9 +16,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       busybox-static git gcc make libc6-dev autoconf \
     && rm -rf /var/lib/apt/lists/*
 
-# umoci: unpack OCI images to a rootfs dir
+# umoci: unpack OCI images to a rootfs dir. Pinned (reproducible) + checksum-verified.
+# Note: as of v0.6.0 the asset was renamed umoci.amd64 -> umoci.linux.amd64.
+ARG UMOCI_VERSION=v0.6.0
+ARG UMOCI_SHA256=b51c267ec394499e42c6fde47f240b7b7dba57ea49df0b5acd304378b82a3b71
 RUN curl -fsSL -o /usr/local/bin/umoci \
-      https://github.com/opencontainers/umoci/releases/latest/download/umoci.amd64 \
+      "https://github.com/opencontainers/umoci/releases/download/${UMOCI_VERSION}/umoci.linux.amd64" \
+    && echo "${UMOCI_SHA256}  /usr/local/bin/umoci" | sha256sum -c - \
     && chmod 0755 /usr/local/bin/umoci
 
 # runsc (gVisor), checksum-verified
@@ -36,7 +40,8 @@ RUN DBVER=2022.83 && D="$(mktemp -d)" \
     && git clone --depth 1 --branch "DROPBEAR_${DBVER}" https://github.com/mkj/dropbear "$D/d" \
     && ( cd "$D/d" && autoconf && autoheader \
          && ./configure --disable-zlib --disable-syslog >/dev/null \
-         && make -j"$(nproc)" PROGRAMS="dropbear dropbearkey" STATIC=1 >/dev/null ) \
+         && make -j"$(nproc)" PROGRAMS="dropbear dropbearkey" \
+              STATIC=1 LDFLAGS="-static -no-pie" >/dev/null ) \
     && cp "$D/d/dropbear" /opt/nan/dropbear && cp "$D/d/dropbearkey" /opt/nan/dropbearkey \
     && chmod 0755 /opt/nan/dropbear /opt/nan/dropbearkey && rm -rf "$D"
 
