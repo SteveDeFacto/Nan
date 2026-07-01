@@ -1,0 +1,11 @@
+{
+  "apps": [
+    {
+      "id": "hello",
+      "name": "Hello (wasi:http)",
+      "file": "hello.wasm",
+      "description": "Minimal wasi:http component that returns a greeting. Smoke-test app.",
+      "mem_mb": 128
+    }
+  ]
+}

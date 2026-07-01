@@ -1,0 +1,34 @@
+# nan-wasm-manager: runs tenant Wasm apps via `wasmtime serve`.
+# No privileged mode, no nested runtime, no namespace/mount/exec ops. The whole
+# reason this backend exists: it runs unprivileged inside Tinfoil's confinement.
+# Image integrity is covered by Tinfoil attestation (the built image is measured),
+# so the wasmtime download is pinned by version for reproducible builds.
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 ca-certificates curl xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# wasmtime CLI (provides `wasmtime serve` for wasi:http components). Pinned.
+ARG WASMTIME_VERSION=v45.0.0
+RUN curl -fsSL \
+      "https://github.com/bytecodealliance/wasmtime/releases/download/${WASMTIME_VERSION}/wasmtime-${WASMTIME_VERSION}-x86_64-linux.tar.xz" \
+      | tar -xJ -C /tmp \
+    && mv "/tmp/wasmtime-${WASMTIME_VERSION}-x86_64-linux/wasmtime" /usr/local/bin/wasmtime \
+    && chmod 0755 /usr/local/bin/wasmtime \
+    && rm -rf /tmp/wasmtime-* \
+    && /usr/local/bin/wasmtime --version
+
+WORKDIR /opt/nan
+
+# The app catalog is baked in, so what runs is exactly what Tinfoil measured.
+# apps/catalog.json + apps/*.wasm. Add wasi:http components here (see apps/README.md).
+COPY apps/ /opt/nan/apps/
+COPY wasm_manager.py /opt/nan/wasm_manager.py
+
+ENV WASM_MANAGER_PORT=8091 \
+    WASM_APPS_DIR=/opt/nan/apps \
+    WASMTIME_BIN=/usr/local/bin/wasmtime
+
+EXPOSE 8091
+CMD ["python3", "/opt/nan/wasm_manager.py"]

@@ -22,7 +22,7 @@ gpus: 1            # whole H200 attached to the enclave (CC allows 1 or 8)
 containers:
   # --- MPS daemon: makes per-tenant SM%/VRAM caps enforceable in prod -----------
   - name: "mps-control"
-    image: "ghcr.io/stevedefacto/nan-mps@sha256:526a951f32b87f52bffbb8b3931fc63d15877960ef7553b8734b32a6f99eba34"
+    image: "ghcr.io/stevedefacto/nan-mps@sha256:9d7626d1f707de4d72a60e9aabb05f80facb0bd1b76f1be9433ca3b636605144"
     runtime: nvidia
     gpus: all
     ipc: host
@@ -39,7 +39,7 @@ containers:
 
   # --- GPU worker: forks MPS-capped CUDA processes per tenant, runs submitted jobs
   - name: "worker"
-    image: "ghcr.io/stevedefacto/nan-worker@sha256:34d8d1441ac0f4917c59e2bbab4030810b71b217c77cb1e4eb3fe2fc40f0fd4f"
+    image: "ghcr.io/stevedefacto/nan-worker@sha256:64df4a18c2876224d7b6e80447310e011ded0eab7cf34672f2ff7e1ddd3a9da6"
     runtime: nvidia
     gpus: all
     ipc: host
@@ -59,7 +59,7 @@ containers:
 
   # --- supervisor: control plane (no GPU), public ingress -----------------------
   - name: "supervisor"
-    image: "ghcr.io/stevedefacto/nan@sha256:93fe749f0fe57d5e7eafce0e932e61cc5826f966c5ccf07b24907ecdfaabebb9"
+    image: "ghcr.io/stevedefacto/nan@sha256:95bfb9b3c858a4d90f2d567fb57cbaf67a04ca0c844a45470b43d10a23ca2bd5"
     restart: always
     env:
       - PORT: "8080"
@@ -100,35 +100,27 @@ containers:
       - ADMIN_TOKEN              # operator token for POST /v1/admin/deployments/:id/provision
     command: ["node", "supervisor.js"]
 
-  # --- runsc manager: CPU container hosting via gVisor (systrap) ----------------
-  # Nested virtualization is unavailable in the enclave (no /dev/kvm, confirmed),
-  # so the qemu microVM path is dead. Each tenant container runs under
-  # `runsc --platform=systrap` instead, in its OWN network namespace (veth pair),
-  # so tenants cannot see each other's loopback or traffic. The supervisor
-  # (PROVISION_BACKEND="vm") speaks the SAME HTTP contract to it and proxies the
-  # data path /x/:id to the tenant's forwarded loopback port. systrap was probed
-  # working in the enclave (root + full caps, ptrace + namespaces permitted).
+  # --- wasm manager: tenant apps via `wasmtime serve` --------------------------
+  # Nested container runtimes (qemu microVM, then gVisor) are both blocked: the
+  # enclave confines this container so it can't create namespaces/mounts or let a
+  # runtime fork/exec its helpers, and privileged: true isn't honored (Tinfoil's
+  # config has no such field). A Wasm runtime needs NONE of those ops, so it runs
+  # inside the confinement as-is. Each tenant app is a `wasmtime serve` subprocess
+  # on a private loopback port; isolation = Wasm sandbox + OS process + curated
+  # WASI (no fs, no host env, no net beyond the served socket). The supervisor
+  # (PROVISION_BACKEND="vm") speaks the SAME /vms contract and proxies /x/:id to
+  # the app's loopback port. No privileged, no netns, no cgroups.
   #
-  # BEFORE DEPLOY:
-  #   1. Build + push nan-runsc-manager (vm/Dockerfile.runsc) and pin its digest.
-  #      Add it to the release workflow alongside the other images.
-  #   2. This container needs CAP_NET_ADMIN + CAP_SYS_ADMIN (or privileged) to
-  #      create per-tenant netns/veth and for runsc's sandbox setup. Confirm the
-  #      Tinfoil container spec grants them.
-  # CPU-only for now: GPU under gVisor (nvproxy) is the next probe, not wired yet.
-  - name: "runsc-manager"
-    image: "ghcr.io/stevedefacto/nan-runsc-manager@sha256:864583709f849017812b24933339aa32623dc83018087f31f831527bd0eb3023"
+  # The app catalog is baked into the image (apps/*.wasm + catalog.json), so what
+  # runs is exactly what Tinfoil attested. Apps are wasi:http components.
+  - name: "wasm-manager"
+    image: "ghcr.io/stevedefacto/nan-wasm-manager@sha256:d4820334f3eb6233f924480db85a24617a22a996a2acb8554938239a7128357b"
     restart: always
-    privileged: true              # netns/veth creation + runsc sandbox setup (see prerequisite 2)
     env:
-      - RUNSC_MANAGER_PORT: "8091"   # same port the supervisor's VMMGR_URL already targets
-      - RUNSC_PLATFORM: "systrap"
+      - WASM_MANAGER_PORT: "8091"   # same port the supervisor's VMMGR_URL already targets
       - NODE_VCPUS: "16"
       - NODE_RAM_GB: "64"
-      - RUNSC_NET_BASE: "10.123.0.0/16"   # carved into a /30 per tenant
-      - RUNSC_TENANT_EGRESS: ""           # empty: inbound only (safer default for confidential compute)
-      - RUNSC_APPLY_LIMITS: "1"           # cgroup cpu/memory caps from share; set "" if cgroups unavailable
-      - NAN_GPU_FORWARDING: ""            # empty: refuse gpu=true until nvproxy is wired
+      - WASM_APP_MEM_MB: "512"      # default per-app address-space cap (RLIMIT_AS)
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8091/health || exit 1"]
       interval: 15s
@@ -145,4 +137,4 @@ shim:
     - /availability
     - /x/*
     # microVM deploys need NO new shim path: /v1/vms/* falls under /v1/* (the
-    # supervisor proxies it to the runsc-manager on :8091), and a container's server is reached via /x/*.
+    # supervisor proxies it to the wasm-manager on :8091), and a container's server is reached via /x/*.
