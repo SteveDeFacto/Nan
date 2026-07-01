@@ -52,7 +52,7 @@ RUNSC         = os.environ.get("RUNSC_BIN", "runsc")
 RUNSC_PLATFORM= os.environ.get("RUNSC_PLATFORM", "systrap")
 RUNSC_ROOT    = os.environ.get("RUNSC_ROOT", "/run/nan-runsc")
 NET_BASE      = os.environ.get("RUNSC_NET_BASE", "10.123.0.0/16")    # carved into /30s, one per tenant
-APPLY_LIMITS  = os.environ.get("RUNSC_APPLY_LIMITS", "1") not in ("", "0", "false")
+APPLY_LIMITS  = os.environ.get("RUNSC_APPLY_LIMITS", "") not in ("", "0", "false")  # off: enclave /sys/fs/cgroup is read-only
 TENANT_EGRESS = os.environ.get("RUNSC_TENANT_EGRESS", "") not in ("", "0", "false")
 GPU_FORWARDING= os.environ.get("NAN_GPU_FORWARDING", "") not in ("", "0", "false")
 MOCK          = os.environ.get("RUNSC_MOCK", "") not in ("", "0", "false")
@@ -469,15 +469,58 @@ def _debug_env() -> dict:
         out["runsc_version"] = lines[0] if lines else ""
     except Exception as e:
         out["runsc_version"] = f"err: {e}"
+
+    # (1) does runsc run AT ALL once cgroups are ignored? (isolates the cgroup issue)
     try:
-        r = subprocess.run([RUNSC, "--platform=systrap", "--network=none",
+        r = subprocess.run([RUNSC, "--platform=systrap", "--network=none", "--ignore-cgroups",
                             f"--root={RUNSC_ROOT}", "do", "/bin/echo", "nan-ok"],
                            capture_output=True, text=True, timeout=30)
-        out["runsc_do"] = {"ok": "nan-ok" in (r.stdout or ""),
-                           "stderr": (r.stderr or "").strip()[-500:]}
+        out["runsc_do_nocg"] = {"ok": "nan-ok" in (r.stdout or ""),
+                                "stderr": (r.stderr or "").strip()[-400:]}
     except Exception as e:
-        out["runsc_do"] = {"ok": False, "error": str(e)}
+        out["runsc_do_nocg"] = {"ok": False, "error": str(e)}
+
+    # (2) can runsc create its OWN per-container netns? (OCI network ns with no path =>
+    # runsc creates it via clone(); this can succeed even though `unshare` no-ops).
+    # If this works, gVisor gives per-tenant isolation without us creating any netns.
+    out["runsc_own_netns"] = _bundle_netns_test()
     return out
+
+
+def _bundle_netns_test() -> dict:
+    bb = oci.GUEST_BUSYBOX
+    if not os.path.exists(bb):
+        return {"ok": False, "error": f"no busybox at {bb}"}
+    work = tempfile.mkdtemp(prefix="nandbg-")
+    try:
+        rootfs = os.path.join(work, "rootfs")
+        os.makedirs(rootfs)
+        shutil.copy2(bb, os.path.join(rootfs, "busybox"))
+        os.chmod(os.path.join(rootfs, "busybox"), 0o755)
+        spec = {
+            "ociVersion": "1.0.0",
+            "process": {"terminal": False, "user": {"uid": 0, "gid": 0},
+                        "args": ["/busybox", "echo", "nan-ok"], "env": ["PATH=/"], "cwd": "/",
+                        "capabilities": {k: ["CAP_NET_BIND_SERVICE"]
+                                         for k in ("bounding", "effective", "permitted")}},
+            "root": {"path": "rootfs", "readonly": True},
+            "hostname": "nandbg",
+            "mounts": [{"destination": "/proc", "type": "proc", "source": "proc"}],
+            "linux": {"namespaces": [{"type": "pid"}, {"type": "network"},   # no path => runsc creates it
+                                     {"type": "ipc"}, {"type": "uts"}, {"type": "mount"}]},
+        }
+        with open(os.path.join(work, "config.json"), "w") as f:
+            json.dump(spec, f)
+        r = subprocess.run([RUNSC, "--platform=systrap", "--network=sandbox", "--ignore-cgroups",
+                            f"--root={RUNSC_ROOT}", "run", "--bundle", work, "nandbg-net"],
+                           capture_output=True, text=True, timeout=40)
+        subprocess.run([RUNSC, f"--root={RUNSC_ROOT}", "delete", "--force", "nandbg-net"],
+                       capture_output=True, timeout=10)
+        return {"ok": "nan-ok" in (r.stdout or ""), "stderr": (r.stderr or "").strip()[-500:]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
