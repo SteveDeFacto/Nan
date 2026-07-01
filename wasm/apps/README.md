@@ -5,6 +5,13 @@ by Tinfoil attestation: what runs in the enclave is exactly what was measured at
 deploy. To add an app, drop its compiled `.wasm` here and add an entry to
 `catalog.json`.
 
+> **This is the attested, baked-in catalog** — the curated apps the enclave runs
+> today, referenced by id (e.g. `hello`). There is a *second*, separate catalog:
+> the **on-chain community app store** (`NanAppCatalog` on Base, the **Apps** tab
+> on the site) where anyone publishes `wasi:http` apps addressed by IPFS CID. That
+> one is open discovery, not attested — see `contracts/README.md`. Run-by-CID from
+> the store is phased in; until then, deploys run from *this* baked-in catalog.
+
 ## App requirements
 
 Apps must be **`wasi:http` components** (the format `wasmtime serve` runs). The

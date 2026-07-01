@@ -435,6 +435,7 @@ footer{border-top:1px solid var(--line-soft);background:var(--bg-1);padding:56px
     <nav class="nav-links" aria-label="Primary">
       <a href="#top" data-view="overview" class="active">Overview</a>
       <a href="#deploy" data-view="deploy">Deploy</a>
+      <a href="#apps" data-view="apps">Apps</a>
       <a href="#api" data-view="api">API</a>
     </nav>
   </div>
@@ -619,6 +620,126 @@ footer{border-top:1px solid var(--line-soft);background:var(--bg-1);padding:56px
     </div>
   </div>
 </section>
+
+<!-- ===================== APP STORE (on-chain catalog) ===================== -->
+<style>
+.store-meta{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px;}
+.store-meta .chip{border:1px solid var(--line);border-radius:7px;padding:.4em .65em;color:var(--text-muted);background:var(--surface);font-family:var(--font-mono);font-size:.72rem;}
+.store-meta .chip b{color:var(--text);}
+.store-meta a.chip[href]:hover{border-color:var(--jade-dim);color:var(--text);}
+.store-toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin:22px 0 18px;}
+.store-toolbar .store-count{font-family:var(--font-mono);font-size:.74rem;color:var(--text-dim);margin-right:auto;}
+#storeSearch{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius-sm);color:var(--text);
+  font-family:var(--font-mono);font-size:.82rem;padding:8px 12px;min-width:200px;}
+#storeSearch:focus{outline:none;border-color:var(--jade-dim);}
+.store-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px;}
+.app-card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:18px 18px 16px;
+  display:flex;flex-direction:column;gap:10px;position:relative;transition:border-color .2s var(--ease),transform .2s var(--ease);}
+.app-card:hover{border-color:var(--line);transform:translateY(-2px);}
+.app-card.verified{border-color:var(--jade-dim);box-shadow:0 0 0 1px var(--jade-deep) inset;}
+.app-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;}
+.app-head h3{margin:0;font-size:1.02rem;line-height:1.3;word-break:break-word;}
+.app-badge{flex:none;font-family:var(--font-mono);font-size:.62rem;letter-spacing:.08em;text-transform:uppercase;
+  padding:3px 8px;border-radius:999px;border:1px solid var(--jade-dim);color:var(--jade);background:var(--jade-deep);white-space:nowrap;}
+.app-badge.unv{border-color:var(--line);color:var(--text-dim);background:transparent;}
+.app-desc{margin:0;font-size:.88rem;color:var(--text-muted);line-height:1.5;flex:1 1 auto;}
+.app-metaline{display:flex;flex-wrap:wrap;gap:8px;font-family:var(--font-mono);font-size:.72rem;color:var(--text-dim);}
+.app-cid{display:flex;align-items:center;gap:6px;background:var(--bg-1);border:1px solid var(--line-soft);border-radius:var(--radius-sm);padding:6px 8px;}
+.app-cid code{font-family:var(--font-mono);font-size:.7rem;color:var(--text-muted);word-break:break-all;line-height:1.4;}
+.app-cid .copybtn{flex:none;margin-left:auto;}
+.app-verrow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+.app-verrow .vlbl{font-family:var(--font-mono);font-size:.68rem;color:var(--text-dim);letter-spacing:.04em;}
+.app-verrow select{background:var(--bg-1);border:1px solid var(--line);border-radius:var(--radius-sm);color:var(--text);font-family:var(--font-mono);font-size:.74rem;padding:5px 8px;max-width:100%;cursor:pointer;}
+.app-verrow select:focus{outline:none;border-color:var(--jade-dim);}
+.app-verrow .vyank{color:var(--danger);font-family:var(--font-mono);font-size:.66rem;}
+.app-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:2px;}
+.store-note{grid-column:1/-1;text-align:center;color:var(--text-muted);padding:44px 16px;border:1px dashed var(--line);border-radius:var(--radius);background:var(--bg-1);}
+.publish-panel{margin-top:22px;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:22px;}
+.publish-panel h4{margin:0 0 4px;font-size:1rem;}
+.publish-panel .pub-sub{margin:0 0 16px;color:var(--text-muted);font-size:.86rem;}
+.pub-grid{display:grid;gap:14px;grid-template-columns:1fr 1fr;}
+.pub-grid .full{grid-column:1/-1;}
+.publish-panel label{display:block;font-family:var(--font-mono);font-size:.72rem;color:var(--text-muted);margin-bottom:6px;}
+.publish-panel input[type=text],.publish-panel input[type=number],.publish-panel textarea{width:100%;background:var(--bg-1);
+  border:1px solid var(--line);border-radius:var(--radius-sm);color:var(--text);font-family:var(--font-mono);font-size:.82rem;padding:9px 11px;}
+.publish-panel textarea{resize:vertical;min-height:64px;line-height:1.5;}
+.publish-panel input:focus,.publish-panel textarea:focus{outline:none;border-color:var(--jade-dim);}
+#pubFileRow.disabled{opacity:.55;}
+#pubFileRow .hint{font-family:var(--font-mono);font-size:.68rem;color:var(--text-dim);margin-top:6px;}
+.pub-actions{display:flex;align-items:center;gap:12px;margin-top:18px;flex-wrap:wrap;}
+.pub-status{font-family:var(--font-mono);font-size:.74rem;color:var(--text-muted);word-break:break-all;flex:1 1 240px;}
+.pub-status.err{color:var(--danger);}
+@media(max-width:640px){.pub-grid{grid-template-columns:1fr;}}
+</style>
+<section id="apps" data-view="apps" aria-label="Wasm app store" hidden>
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="eyebrow">App store · on-chain catalog</span>
+      <h2>Browse and publish Wasm apps.</h2>
+      <p>Every app here is a <b>wasi:http</b> component whose bytes live on <b>IPFS</b>, addressed by their <b>CID</b>. The catalog itself is a smart contract on <b>Base</b> (<span class="mono">NanAppCatalog</span>): anyone can publish, each listing is attributed on-chain to the publisher's wallet, and because a CID is a hash of the exact wasm you can pull it from any IPFS peer and verify the bytes yourself. Reading needs no wallet; publishing is one Base transaction. Deploying a community app by CID is <b>rolling out</b> — today the <a href="#deploy">Deploy console</a> runs the attested, baked-in catalog (e.g. <span class="mono">hello</span>).</p>
+      <div class="store-meta">
+        <a class="chip" id="catAddrLink" target="_blank" rel="noopener">contract <b id="catAddrShort">…</b></a>
+        <span class="chip">chain <b id="catChain">Base · 8453</b></span>
+        <span class="chip">code <b>IPFS · CID-addressed</b></span>
+      </div>
+    </div>
+
+    <div class="store-toolbar">
+      <div class="seg" id="storeFilter" role="group" aria-label="Filter apps">
+        <button data-filter="verified" type="button">Verified</button>
+        <button data-filter="all" class="on" type="button">All</button>
+      </div>
+      <input type="text" id="storeSearch" placeholder="search name, CID, publisher…" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Search apps" />
+      <span class="store-count" id="storeCount"></span>
+      <button class="btn btn-sm" id="storeRefresh" type="button">↻ refresh</button>
+      <button class="btn btn-primary btn-sm" id="storePublishBtn" type="button">+ Publish app</button>
+    </div>
+
+    <div class="store-grid" id="storeGrid"></div>
+
+    <div class="publish-panel" id="publishPanel" hidden>
+      <h4>Publish a Wasm app version</h4>
+      <p class="pub-sub">Add a <span class="mono">wasi:http</span> component release to the on-chain catalog. Its bytes go on IPFS; the CID and metadata go on Base. An app is keyed by <b>slug</b> in your wallet's namespace — publish the same slug again to cut a new <b>version</b>. Only you (<span class="mono">msg.sender</span>) can add versions, edit, or delist it.</p>
+      <div class="pub-grid">
+        <div>
+          <label for="pubSlug">App slug <span class="dim">(stable id · a–z0–9-, ≤ 40)</span></label>
+          <input type="text" id="pubSlug" maxlength="40" placeholder="my-app" spellcheck="false" autocapitalize="off" autocomplete="off" />
+        </div>
+        <div>
+          <label for="pubVersion">Version <span class="dim">(label · e.g. 1.0.0)</span></label>
+          <input type="text" id="pubVersion" maxlength="32" value="1.0.0" placeholder="1.0.0" spellcheck="false" autocapitalize="off" autocomplete="off" />
+        </div>
+        <div class="full" id="pubFileRow">
+          <label for="pubFile">Wasm file <span class="dim">(.wasm component · ≤ 256 MB · uploaded &amp; pinned to IPFS)</span></label>
+          <input type="file" id="pubFile" accept=".wasm,application/wasm" />
+          <div class="hint" id="pubFileHint"></div>
+        </div>
+        <div class="full">
+          <label for="pubCid">IPFS CID <span class="dim">(auto-filled after upload, or paste one you've pinned)</span></label>
+          <input type="text" id="pubCid" placeholder="bafybei…" spellcheck="false" autocapitalize="off" autocomplete="off" />
+        </div>
+        <div>
+          <label for="pubName">Name <span class="dim">(display)</span></label>
+          <input type="text" id="pubName" maxlength="80" placeholder="My app" spellcheck="false" />
+        </div>
+        <div>
+          <label for="pubMem">Memory cap <span class="dim">(MB · 1–8192)</span></label>
+          <input type="number" id="pubMem" value="128" min="1" max="8192" step="1" />
+        </div>
+        <div class="full">
+          <label for="pubDesc">Description <span class="dim">(≤ 500 chars)</span></label>
+          <textarea id="pubDesc" maxlength="500" placeholder="What does it do?"></textarea>
+        </div>
+      </div>
+      <div class="pub-actions">
+        <button class="btn btn-primary btn-sm" id="pubSubmit" type="button">Publish to Base</button>
+        <button class="btn btn-sm" id="pubCancel" type="button">cancel</button>
+        <span class="pub-status" id="pubStatus"></span>
+      </div>
+    </div>
+  </div>
+</section>
+
 <section id="attest" data-view="overview" style="background:var(--bg-1);border-top:1px solid var(--line-soft);border-bottom:1px solid var(--line-soft);" aria-label="Attestation">
   <div class="wrap">
     <div class="sec-head">
@@ -3519,6 +3640,7 @@ function setView(view, anchor){
   try { history.replaceState(null, "", view === "overview" ? (anchor ? "#" + anchor : "#top") : "#" + view); } catch(e){}
   if (view === "deploy"){ if (typeof refreshEnclaves === "function") refreshEnclaves(); }
   else if (typeof stopEncPoll === "function"){ stopEncPoll(); }
+  if (view === "apps"){ if (typeof loadCatalog === "function") loadCatalog(); }
 }
 function viewOf(id){
   const el = id && document.getElementById(id);
@@ -3539,6 +3661,347 @@ function initViews(){
   setView(v0, (v0 === "overview" && id0 && id0 !== "top") ? id0 : null);
 }
 
+/* ============================================================
+   App store · on-chain catalog (NanAppCatalog on Base) + IPFS CIDs
+   Apps are versioned: keyed by keccak256(publisher, slug), each with an
+   append-only list of releases (own CID, label, verified/yank flags).
+   Browsing reads the contract via a public RPC eth_call (no wallet).
+   Publishing is one Base tx through the injected wallet, reusing the
+   same hand-rolled ABI codec as the pay flow (no web3 lib on-page).
+   ============================================================ */
+const APP_CATALOG_ADDRESS = "0x214bcF871d4Fa9dAc8D46D0Dc4Bdce0b9eFEf65b"; // NanAppCatalog on Base — written automatically by scripts/deploy-app-catalog.mjs
+const APP_CATALOG_CHAIN   = 8453;                        // Base mainnet (kept in sync by the deploy script; 84532 = Base Sepolia)
+const APP_CATALOG_RPC     = "https://mainnet.base.org";  // read-only eth_call endpoint; browsing needs no wallet (CORS-enabled)
+const IPFS_UPLOAD_URL      = "https://ipfs.nan.host/add-wasm"; // validating upload gateway (server validates + pins); empty => paste-a-CID only
+const IPFS_GATEWAY        = "https://ipfs.io/ipfs/";      // where the "fetch .wasm" links resolve
+const MAX_WASM_MB         = 256;                          // upload ceiling (also enforced server-side by Caddy request_body max_size)
+const MAX_WASM_BYTES      = MAX_WASM_MB * 1024 * 1024;
+
+const CAT_SEL = {
+  appCount:"b55ca2c3", getAppsPage:"a0483de1", getVersionsPage:"2eb7c1f0", owner:"8da5cb5b",
+  publishVersion:"7535857a", setActive:"9e4b5d56", yankVersion:"345c52dc", setVerified:"4ca171e5",
+};
+const CAT_MAX = { slug:40, name:80, desc:500, version:32, cid:100, mem:8192 };
+const APP_SCHEMA = [
+  {k:"appId",t:"bytes32"},{k:"publisher",t:"addr"},{k:"slug",t:"str"},{k:"name",t:"str"},
+  {k:"description",t:"str"},{k:"versionCount",t:"uint"},{k:"createdAt",t:"uint"},{k:"updatedAt",t:"uint"},{k:"active",t:"bool"},
+];
+const VER_SCHEMA = [
+  {k:"cid",t:"str"},{k:"version",t:"str"},{k:"memMb",t:"uint"},{k:"createdAt",t:"uint"},{k:"verified",t:"bool"},{k:"yanked",t:"bool"},
+];
+const STORE = { apps:[], byId:{}, sel:{}, owner:null, filter:"all", loaded:false, loading:false };
+
+const blen = (s) => new TextEncoder().encode(s || "").length;
+const hexBig = (h) => (!h || h === "0x") ? 0n : BigInt(h);
+function catConfigured(){ return APP_CATALOG_ADDRESS && !/^0x0+$/i.test(APP_CATALOG_ADDRESS); }
+function catExplorer(){ return APP_CATALOG_CHAIN === 84532 ? "https://sepolia.basescan.org" : "https://basescan.org"; }
+
+/* ---- read side: JSON-RPC eth_call against a public Base RPC ---- */
+async function ethCall(data){
+  const r = await fetch(APP_CATALOG_RPC, { method:"POST", headers:{ "content-type":"application/json" },
+    body: JSON.stringify({ jsonrpc:"2.0", id:1, method:"eth_call", params:[{ to:APP_CATALOG_ADDRESS, data }, "latest"] }) });
+  const j = await r.json().catch(() => ({}));
+  if (j.error) throw new NanError(j.error.message || "eth_call failed", 0);
+  return j.result || "0x";
+}
+
+/* ---- minimal ABI codec (generic encode + struct-array decode), verified vs viem ---- */
+function encStr(s){
+  const b = new TextEncoder().encode(s); let h = "";
+  for (const x of b) h += x.toString(16).padStart(2, "0");
+  return { body: encUint(b.length) + h.padEnd(Math.ceil(h.length / 64) * 64, "0"), words: 1 + Math.ceil(b.length / 32) };
+}
+// args: [{t:'str'|'uint'|'bool'|'addr'|'bytes32', v}] — head (offsets/inline) then string tails.
+function encCall(selector, args){
+  let off = args.length * 32; const heads = [], bodies = [];
+  for (const a of args){
+    if (a.t === "str"){ const e = encStr(a.v); heads.push(encUint(off)); off += e.words * 32; bodies.push(e.body); }
+    else if (a.t === "uint") heads.push(encUint(a.v));
+    else if (a.t === "bool") heads.push(encUint(a.v ? 1 : 0));
+    else heads.push(pad32(a.v.replace(/^0x/, "")));   // addr | bytes32
+  }
+  return "0x" + selector + heads.join("") + bodies.join("");
+}
+function hexToUtf8(h){ const b = new Uint8Array(h.length / 2); for (let i = 0; i < b.length; i++) b[i] = parseInt(h.substr(i * 2, 2), 16); return new TextDecoder().decode(b); }
+// decode a dynamic T[] where T is a tuple of str|uint|bool|addr|bytes32 fields (per `schema`).
+function decodeStructArray(hex, schema){
+  const buf = (hex || "").replace(/^0x/, "");
+  if (buf.length < 64) return [];
+  const ru   = (o) => BigInt("0x" + buf.slice(o * 2, o * 2 + 64));
+  const radd = (o) => "0x" + buf.slice(o * 2 + 24, o * 2 + 64);
+  const rb32 = (o) => "0x" + buf.slice(o * 2, o * 2 + 64);
+  const rstr = (o) => { const len = Number(ru(o)); const s = (o + 32) * 2; return hexToUtf8(buf.slice(s, s + len * 2)); };
+  const arrOff = Number(ru(0)), len = Number(ru(arrOff)), elems = arrOff + 32, out = [];
+  for (let k = 0; k < len; k++){
+    const ts = elems + Number(ru(elems + k * 32)), obj = {};
+    schema.forEach((f, fi) => {
+      const w = ts + fi * 32;
+      if (f.t === "str") obj[f.k] = rstr(ts + Number(ru(w)));
+      else if (f.t === "uint") obj[f.k] = Number(ru(w));
+      else if (f.t === "addr") obj[f.k] = radd(w);
+      else if (f.t === "bool") obj[f.k] = ru(w) !== 0n;
+      else if (f.t === "bytes32") obj[f.k] = rb32(w);
+    });
+    out.push(obj);
+  }
+  return out;
+}
+
+async function appCount(){ return Number(hexBig(await ethCall("0x" + CAT_SEL.appCount))); }
+async function catGetAppsPage(start, n){
+  return decodeStructArray(await ethCall(encCall(CAT_SEL.getAppsPage, [{t:"uint",v:start},{t:"uint",v:n}])), APP_SCHEMA);
+}
+async function catGetVersions(appId, count){
+  const vs = []; const PAGE = 50;
+  for (let s = 0; s < count; s += PAGE)
+    vs.push(...decodeStructArray(await ethCall(encCall(CAT_SEL.getVersionsPage, [{t:"bytes32",v:appId},{t:"uint",v:s},{t:"uint",v:PAGE}])), VER_SCHEMA));
+  return vs;
+}
+async function catOwner(){ const r = await ethCall("0x" + CAT_SEL.owner); return "0x" + (r || "").replace(/^0x/, "").slice(24).padStart(40, "0"); }
+
+async function loadCatalog(force){
+  const grid = $("#storeGrid"); if (!grid) return;
+  if (!catConfigured()){ STORE.loaded = true; renderApps(); return; }
+  if (STORE.loading || (STORE.loaded && !force)) return;
+  STORE.loading = true;
+  if (!STORE.loaded) grid.innerHTML = '<div class="store-note">reading catalog from Base…</div>';
+  try {
+    const n = await appCount();
+    const apps = []; const PAGE = 50;
+    for (let s = 0; s < n; s += PAGE) apps.push(...await catGetAppsPage(s, PAGE));
+    await Promise.all(apps.map(async a => { a.versions = await catGetVersions(a.appId, a.versionCount); }));
+    STORE.apps = apps; STORE.byId = {}; apps.forEach(a => STORE.byId[a.appId] = a);
+    STORE.loaded = true;
+    catOwner().then(o => { STORE.owner = o.toLowerCase(); renderApps(); }).catch(() => {});
+  } catch(e){
+    grid.innerHTML = '<div class="store-note">Couldn’t read the catalog: ' + esc(e.message || String(e)) + '<br><span class="dim">Check APP_CATALOG_RPC / the contract address.</span></div>';
+    STORE.loading = false; return;
+  }
+  STORE.loading = false; renderApps();
+}
+
+/* ---- version selection helpers ---- */
+function defaultIdx(app){                                   // newest non-yanked release, else newest
+  for (let i = app.versions.length - 1; i >= 0; i--) if (!app.versions[i].yanked) return i;
+  return app.versions.length - 1;
+}
+function selIdx(app){
+  const s = STORE.sel[app.appId];
+  return (s != null && s >= 0 && s < app.versions.length) ? s : defaultIdx(app);
+}
+const appVerified = (app) => { const i = defaultIdx(app); return i >= 0 && app.versions[i].verified; };
+
+/* ---- render ---- */
+function renderApps(){
+  const grid = $("#storeGrid"), count = $("#storeCount"); if (!grid) return;
+  if (!catConfigured()){
+    grid.innerHTML = '<div class="store-note">The on-chain catalog isn’t wired up on this deployment yet.<br><span class="dim">Deploy <code>NanAppCatalog</code> with <code>scripts/deploy-app-catalog.mjs</code> — it writes the address in for you.</span></div>';
+    if (count) count.textContent = ""; return;
+  }
+  if (!STORE.loaded){ grid.innerHTML = '<div class="store-note">reading catalog from Base…</div>'; return; }
+  const q = ($("#storeSearch") && $("#storeSearch").value || "").trim().toLowerCase();
+  let apps = STORE.apps.filter(a => a.active && a.versions.length);
+  if (STORE.filter === "verified") apps = apps.filter(appVerified);
+  if (q) apps = apps.filter(a => (a.name + " " + a.description + " " + a.slug + " " + a.publisher + " " + a.versions.map(v => v.cid + " " + v.version).join(" ")).toLowerCase().includes(q));
+  apps.sort((x, y) => (Number(appVerified(y)) - Number(appVerified(x))) || (y.updatedAt - x.updatedAt));
+  if (count) count.textContent = apps.length + (apps.length === 1 ? " app" : " apps") + (STORE.filter === "verified" ? " · verified" : "");
+  if (!apps.length){
+    grid.innerHTML = '<div class="store-note">' + (STORE.apps.length ? "No apps match your filter." : "No apps published yet — be the first with <b>+ Publish app</b>.") + '</div>';
+    return;
+  }
+  grid.innerHTML = apps.map(appCard).join("");
+}
+function appCard(app){
+  const i = selIdx(app);
+  const v = app.versions[i] || { cid:"", version:"—", memMb:0, verified:false, yanked:false };
+  const me = (Nan.address || "").toLowerCase();
+  const isPub = me && app.publisher.toLowerCase() === me;
+  const isOwner = me && STORE.owner && me === STORE.owner;
+  const gw = IPFS_GATEWAY.replace(/\/+$/, "") + "/" + encodeURIComponent(v.cid);
+  const badge = v.verified
+    ? '<span class="app-badge" title="This version is marked verified by the catalog owner">✓ verified</span>'
+    : '<span class="app-badge unv" title="Community-published; not owner-verified">community</span>';
+  const opts = app.versions.map((vv, idx) =>
+    '<option value="' + idx + '"' + (idx === i ? ' selected' : '') + '>' + esc(vv.version) + (vv.verified ? ' ✓' : '') + (vv.yanked ? ' (yanked)' : '') + '</option>').join('');
+  return '<article class="app-card' + (v.verified ? ' verified' : '') + '" data-appid="' + app.appId + '">'
+    + '<div class="app-head"><h3>' + esc(app.name) + '</h3>' + badge + '</div>'
+    + '<p class="app-desc">' + (app.description ? esc(app.description) : '<span class="dim">no description</span>') + '</p>'
+    + '<div class="app-metaline"><span title="publisher (msg.sender)">' + short(app.publisher) + '</span><span>·</span><span>' + app.versions.length + (app.versions.length === 1 ? ' version' : ' versions') + '</span></div>'
+    + '<div class="app-verrow"><span class="vlbl">version</span><select class="ver-select" aria-label="Version">' + opts + '</select><span>' + v.memMb + ' MB</span>' + (v.yanked ? '<span class="vyank">yanked</span>' : '') + '</div>'
+    + '<div class="app-cid" title="IPFS content id"><code>' + esc(v.cid) + '</code><button class="copybtn" data-act="copy" data-cid="' + esc(v.cid) + '" type="button">⧉</button></div>'
+    + '<div class="app-actions">'
+    + '<button class="btn btn-primary btn-sm" data-act="deploy" data-cid="' + esc(v.cid) + '" type="button">Use in Deploy →</button>'
+    + '<a class="btn btn-sm" href="' + gw + '" target="_blank" rel="noopener">fetch .wasm</a>'
+    + (isPub ? '<button class="btn btn-sm" data-act="delist" type="button">delist</button>' : '')
+    + (isPub && !v.yanked ? '<button class="btn btn-sm" data-act="yank" data-idx="' + i + '" type="button">yank</button>' : '')
+    + (isOwner ? '<button class="btn btn-sm" data-act="verify" data-idx="' + i + '" data-v="' + (v.verified ? 0 : 1) + '" type="button">' + (v.verified ? 'unverify' : 'verify') + '</button>' : '')
+    + '</div></article>';
+}
+function refreshCard(appId){
+  const grid = $("#storeGrid"); if (!grid) return;
+  const art = grid.querySelector('article[data-appid="' + appId + '"]'), app = STORE.byId[appId];
+  if (art && app) art.outerHTML = appCard(app);
+}
+function useInDeploy(cid){
+  const inp = $("#cfgImage");
+  if (inp){ inp.value = "ipfs://" + cid; if (typeof renderDeploy === "function") renderDeploy(); }
+  setView("deploy");
+  showToast("Prefilled Deploy with ipfs://" + cid.slice(0, 12) + "… · run-by-CID is rolling out; baked-in ids (e.g. hello) deploy today");
+}
+
+/* ---- write side: IPFS upload + publish/verify/yank/delist txs ---- */
+// Client-side sanity checks (UX + catch mistakes). NOT a security control: the
+// /add endpoint is public, so Caddy's request_body max_size is the real ceiling,
+// and the attested wasm-manager is the authoritative "is it a runnable component"
+// gate at deploy. WebAssembly.validate() can't help — it only validates core
+// modules, and NAN apps are components — so we check the binary preamble by hand.
+async function validateWasm(file){
+  if (!/\.wasm$/i.test(file.name || "")) throw new NanError("Pick a .wasm file.", 0);
+  if (file.size < 8) throw new NanError("That file is too small to be a WebAssembly module.", 0);
+  if (file.size > MAX_WASM_BYTES) throw new NanError("Too large — max " + MAX_WASM_MB + " MB (this file is " + (file.size / 1048576).toFixed(1) + " MB).", 0);
+  const h = new Uint8Array(await file.slice(0, 8).arrayBuffer());
+  if (!(h[0] === 0x00 && h[1] === 0x61 && h[2] === 0x73 && h[3] === 0x6d))    // "\0asm" magic
+    throw new NanError("Not a WebAssembly file (missing the \\0asm magic bytes).", 0);
+  // Preamble after the magic is version:u16 + layer:u16. Key on the layer, which is
+  // stable across component-version bumps: 0 = core module, 1 = component.
+  const layer = h[6] | (h[7] << 8);
+  if (layer === 0) throw new NanError("This is a core wasm module, but NAN runs wasi:http *components*. Rebuild with cargo-component (target wasm32-wasip2).", 0);
+  if (layer !== 1) throw new NanError("Unrecognized wasm preamble (layer " + layer + ") — expected a wasi:http component.", 0);
+  return true;
+}
+async function putWasm(file){
+  if (!IPFS_UPLOAD_URL) throw new NanError("Direct upload isn’t configured here — paste a CID you’ve pinned (e.g. `ipfs add app.wasm`).", 0);
+  if (file.size > MAX_WASM_BYTES) throw new NanError("Too large — max " + MAX_WASM_MB + " MB.", 0);
+  // raw bytes to the validating gateway; it re-checks size + wasm component preamble
+  // server-side, pins to IPFS, and returns { cid }. (The browser checks are just UX.)
+  const r = await fetch(IPFS_UPLOAD_URL, { method: "POST", headers: { "content-type": "application/wasm" }, body: file });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new NanError("upload rejected: " + (j.error || ("HTTP " + r.status)), 0);
+  if (!j.cid) throw new NanError("gateway returned no CID", 0);
+  return j.cid;
+}
+async function ensureCatalogChain(){
+  if (APP_CATALOG_CHAIN === BASE_CHAIN) return ensureBaseChain();
+  const hex = "0x" + APP_CATALOG_CHAIN.toString(16);
+  let cur; try { cur = await Nan.provider.request({ method: "eth_chainId" }); } catch { cur = null; }
+  if (cur && String(cur).toLowerCase() === hex) return;
+  try { await Nan.provider.request({ method: "wallet_switchEthereumChain", params: [{ chainId: hex }] }); }
+  catch(e){ throw new NanError("Switch your wallet to chain " + APP_CATALOG_CHAIN + " to publish.", 0); }
+}
+async function waitReceipt(hash, tries){
+  tries = tries || 45;
+  for (let i = 0; i < tries; i++){
+    const r = await fetch(APP_CATALOG_RPC, { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc:"2.0", id:1, method:"eth_getTransactionReceipt", params:[hash] }) });
+    const j = await r.json().catch(() => ({}));
+    if (j.result){ if (hexBig(j.result.status) === 0n) throw new NanError("transaction reverted", 0); return j.result; }
+    await new Promise(res => setTimeout(res, 2000));
+  }
+  throw new NanError("timed out waiting for confirmation (it may still land — hit refresh shortly)", 0);
+}
+function pubStatus(msg, err){ const el = $("#pubStatus"); if (!el) return; el.textContent = msg || ""; el.className = "pub-status" + (err ? " err" : ""); }
+async function onPubFile(e){
+  const f = e.target.files && e.target.files[0]; if (!f) return;
+  $("#pubFileHint").textContent = f.name + " · " + (f.size / 1048576).toFixed(2) + " MB";
+  try { await validateWasm(f); }
+  catch(err){ pubStatus(err.message || String(err), true); e.target.value = ""; $("#pubCid").value = ""; return; }
+  pubStatus("valid component · uploading to IPFS…");
+  try { const cid = await putWasm(f); $("#pubCid").value = cid; pubStatus("pinned · CID " + cid); }
+  catch(err){ pubStatus(err.message || String(err), true); }
+}
+async function publishApp(){
+  const slug = $("#pubSlug").value.trim(), version = $("#pubVersion").value.trim();
+  const cid = $("#pubCid").value.trim(), name = $("#pubName").value.trim(), desc = $("#pubDesc").value.trim();
+  const mem = parseInt($("#pubMem").value, 10) || 0;
+  if (!catConfigured()) return pubStatus("catalog contract address isn’t set on this site yet", true);
+  if (!slug || blen(slug) > CAT_MAX.slug) return pubStatus("app slug is required (≤ 40 bytes)", true);
+  if (!version || blen(version) > CAT_MAX.version) return pubStatus("version label is required (≤ 32 bytes)", true);
+  if (!cid || blen(cid) > CAT_MAX.cid) return pubStatus("enter a valid IPFS CID (≤ 100 bytes)", true);
+  if (!name || blen(name) > CAT_MAX.name) return pubStatus("name is required (≤ 80 bytes)", true);
+  if (blen(desc) > CAT_MAX.desc) return pubStatus("description too long (≤ 500 bytes)", true);
+  if (!(mem > 0 && mem <= CAT_MAX.mem)) return pubStatus("memory must be 1–8192 MB", true);
+  const btn = $("#pubSubmit"); btn.disabled = true; const lbl = btn.textContent; btn.textContent = "working…";
+  try {
+    if (!Nan.provider) await connectWallet();
+    await ensureCatalogChain();
+    pubStatus("confirm the transaction in your wallet…");
+    const data = encCall(CAT_SEL.publishVersion, [
+      {t:"str",v:slug},{t:"str",v:name},{t:"str",v:desc},{t:"str",v:version},{t:"str",v:cid},{t:"uint",v:mem},
+    ]);
+    const hash = await sendTx(APP_CATALOG_ADDRESS, data);
+    pubStatus("sent · " + hash + " — waiting for confirmation…");
+    await waitReceipt(hash);
+    pubStatus("live on-chain ✓ " + hash);
+    showToast("published " + slug + " " + version);
+    await loadCatalog(true);
+    togglePublish(false); resetPublish();
+  } catch(e){ pubStatus(e.message || String(e), true); }
+  finally { btn.disabled = false; btn.textContent = lbl; }
+}
+async function catTx(data, verb){
+  try {
+    if (!Nan.provider) await connectWallet();
+    await ensureCatalogChain();
+    const hash = await sendTx(APP_CATALOG_ADDRESS, data);
+    showToast(verb + " · " + hash.slice(0, 12) + "…");
+    await waitReceipt(hash); await loadCatalog(true);
+  } catch(e){ showToast(e.message || String(e)); }
+}
+const setActiveTx   = (slug, active) => catTx(encCall(CAT_SEL.setActive,   [{t:"str",v:slug},{t:"bool",v:active}]), active ? "relisting" : "delisting");
+const yankTx        = (slug, idx)    => catTx(encCall(CAT_SEL.yankVersion, [{t:"str",v:slug},{t:"uint",v:idx}]),   "yanking");
+const setVerifiedTx = (appId, idx, v) => catTx(encCall(CAT_SEL.setVerified, [{t:"bytes32",v:appId},{t:"uint",v:idx},{t:"bool",v:v}]), v ? "verifying" : "unverifying");
+
+function resetPublish(){
+  ["#pubSlug","#pubCid","#pubName","#pubDesc"].forEach(s => { const el = $(s); if (el) el.value = ""; });
+  const f = $("#pubFile"); if (f) f.value = ""; const h = $("#pubFileHint"); if (h) h.textContent = "";
+  $("#pubVersion").value = "1.0.0"; $("#pubMem").value = "128"; pubStatus("");
+}
+function togglePublish(show){
+  const p = $("#publishPanel"), b = $("#storePublishBtn"); if (!p) return;
+  const open = (show === undefined) ? p.hidden : show;
+  p.hidden = !open; if (b) b.textContent = open ? "✕ close" : "+ Publish app";
+  if (open) p.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+function initStore(){
+  const grid = $("#storeGrid"); if (!grid) return;
+  const link = $("#catAddrLink"), sh = $("#catAddrShort"), ch = $("#catChain");
+  if (ch) ch.textContent = (APP_CATALOG_CHAIN === 84532 ? "Base Sepolia · " : "Base · ") + APP_CATALOG_CHAIN;
+  if (link && sh){
+    if (catConfigured()){ link.href = catExplorer() + "/address/" + APP_CATALOG_ADDRESS; sh.textContent = short(APP_CATALOG_ADDRESS); }
+    else { link.removeAttribute("href"); sh.textContent = "not deployed"; }
+  }
+  $$("#storeFilter button").forEach(b => b.addEventListener("click", () => {
+    $$("#storeFilter button").forEach(x => x.classList.remove("on")); b.classList.add("on");
+    STORE.filter = b.dataset.filter; renderApps();
+  }));
+  const s = $("#storeSearch"); if (s) s.addEventListener("input", renderApps);
+  const rf = $("#storeRefresh"); if (rf) rf.addEventListener("click", () => loadCatalog(true));
+  $("#storePublishBtn").addEventListener("click", () => togglePublish());
+  $("#pubCancel").addEventListener("click", () => togglePublish(false));
+  $("#pubSubmit").addEventListener("click", publishApp);
+  const pf = $("#pubFile"); if (pf) pf.addEventListener("change", onPubFile);
+  const row = $("#pubFileRow");
+  if (row && !IPFS_UPLOAD_URL){ row.classList.add("disabled"); $("#pubFileHint").textContent = "upload disabled here — paste a CID below"; }
+
+  // event delegation on the grid (survives re-renders)
+  grid.addEventListener("change", (e) => {
+    const sel = e.target.closest(".ver-select"); if (!sel) return;
+    const art = sel.closest("article[data-appid]"); if (!art) return;
+    STORE.sel[art.dataset.appid] = parseInt(sel.value, 10); refreshCard(art.dataset.appid);
+  });
+  grid.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-act]"); if (!btn) return;
+    const art = btn.closest("article[data-appid]"); if (!art) return;
+    const app = STORE.byId[art.dataset.appid]; if (!app) return;
+    const act = btn.dataset.act;
+    if (act === "copy") copyText(btn.dataset.cid, btn);
+    else if (act === "deploy") useInDeploy(btn.dataset.cid);
+    else if (act === "delist"){ if (confirm("Delist this whole app? It stays on-chain but is hidden from the store.")) setActiveTx(app.slug, false); }
+    else if (act === "yank"){ const idx = parseInt(btn.dataset.idx, 10); if (confirm("Yank version " + app.versions[idx].version + "? It stays on-chain but readers hide it.")) yankTx(app.slug, idx); }
+    else if (act === "verify") setVerifiedTx(app.appId, parseInt(btn.dataset.idx, 10), btn.dataset.v === "1");
+  });
+}
+
 function init() {
   const gs = document.createElement("style");
   gs.textContent = "html{scroll-behavior:smooth;scroll-padding-top:80px;}";
@@ -3550,6 +4013,7 @@ function init() {
   run(initTicker);
   run(initFlow);
   run(initDeploy);
+  run(initStore);
   run(initAttest);
   run(initMenu);
   run(initApp);

@@ -12,7 +12,10 @@
 //     node scripts/deploy-nanpay.mjs                 # -> Base SEPOLIA testnet (default)
 //
 //   NETWORK=base DEPLOYER_PRIVATE_KEY=0x... PAYOUT_ADDRESS=0x... \
-//     node scripts/deploy-nanpay.mjs --write-config   # -> Base MAINNET + repin config
+//     node scripts/deploy-nanpay.mjs                 # -> Base MAINNET
+//
+// On a successful deploy it writes FORWARDER_ADDRESS into tinfoil-config.yml
+// automatically (pass --no-write-config to skip).
 //
 // Env:
 //   DEPLOYER_PRIVATE_KEY  required. Pays gas, becomes contract owner.
@@ -24,7 +27,7 @@
 //   USDC_ADDRESS          override the USDC token address for the network.
 //   ETH_RPC               L1 RPC for ENS resolution (default cloudflare-eth.com).
 // Flags:
-//   --write-config        rewrite FORWARDER_ADDRESS in tinfoil-config.yml
+//   --no-write-config     do NOT touch tinfoil-config.yml (default is to write it)
 //   --yes                 skip the interactive confirmation (CI)
 //   --dry-run             compile + show the plan, do NOT broadcast
 
@@ -49,7 +52,7 @@ const CONFIG = path.join(REPO, "tinfoil-config.yml");
 
 const args = new Set(process.argv.slice(2));
 const DRY_RUN = args.has("--dry-run");
-const WRITE_CONFIG = args.has("--write-config");
+const NO_WRITE_CONFIG = args.has("--no-write-config"); // config is written by default on a successful deploy
 const ASSUME_YES = args.has("--yes");
 
 const NETWORKS = {
@@ -205,8 +208,8 @@ async function main() {
   console.log(`  set in config    FORWARDER_ADDRESS: "${addr}"`);
   console.log("===============================================================\n");
 
-  if (WRITE_CONFIG) writeForwarder(addr);
-  else console.log("(re-run with --write-config to write FORWARDER_ADDRESS into tinfoil-config.yml)");
+  if (!NO_WRITE_CONFIG) writeForwarder(addr);
+  else console.log("(--no-write-config: skipped tinfoil-config.yml; set FORWARDER_ADDRESS manually)");
 
   console.log("\nNext:");
   console.log(`  1. Set FORWARDER_ADDRESS in tinfoil-config.yml to ${addr}`);
