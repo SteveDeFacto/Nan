@@ -420,6 +420,66 @@ def _kill(vid: str) -> bool:
 
 
 # ---- HTTP ------------------------------------------------------------------ #
+def _debug_env() -> dict:
+    """Report, from the manager's ACTUAL runtime, the facts that decide the
+    isolation design: kernel string (gVisor leaves a signature), whether any
+    unshare variant makes a genuinely distinct netns, and whether nested runsc
+    runs here at all. This is read-only."""
+    out = {}
+    try:
+        out["uname"] = " ".join(os.uname())
+    except Exception as e:
+        out["uname"] = f"err: {e}"
+    try:
+        out["proc_version"] = open("/proc/version").read().strip()
+    except Exception as e:
+        out["proc_version"] = f"err: {e}"
+    try:
+        out["init_netns"] = os.readlink("/proc/self/ns/net")
+    except Exception as e:
+        out["init_netns"] = f"err: {e}"
+
+    variants = {"net": ["--net"],
+                "net_user": ["--net", "--user", "--map-root-user"],
+                "user_net": ["--user", "--map-root-user", "--net"]}
+    netns = {}
+    for name, flags in variants.items():
+        try:
+            h = subprocess.Popen(["unshare", *flags, "--", "sleep", "10"],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.PIPE)
+            p = f"/proc/{h.pid}/ns/net"
+            for _ in range(50):
+                if os.path.exists(p) or h.poll() is not None:
+                    break
+                time.sleep(0.02)
+            if h.poll() is not None:
+                netns[name] = {"distinct": False,
+                               "err": (h.stderr.read().decode().strip() or "exited")[:160]}
+            else:
+                netns[name] = {"distinct": os.readlink(p) != os.readlink("/proc/self/ns/net")}
+                h.kill()
+        except Exception as e:
+            netns[name] = {"error": str(e)}
+    out["netns"] = netns
+
+    try:
+        v = subprocess.run([RUNSC, "--version"], capture_output=True, text=True, timeout=10)
+        lines = (v.stdout or v.stderr or "").strip().splitlines()
+        out["runsc_version"] = lines[0] if lines else ""
+    except Exception as e:
+        out["runsc_version"] = f"err: {e}"
+    try:
+        r = subprocess.run([RUNSC, "--platform=systrap", "--network=none",
+                            f"--root={RUNSC_ROOT}", "do", "/bin/echo", "nan-ok"],
+                           capture_output=True, text=True, timeout=30)
+        out["runsc_do"] = {"ok": "nan-ok" in (r.stdout or ""),
+                           "stderr": (r.stderr or "").strip()[-500:]}
+    except Exception as e:
+        out["runsc_do"] = {"ok": False, "error": str(e)}
+    return out
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def _json(self, code, obj):
         body = json.dumps(obj).encode()
@@ -436,6 +496,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path == "/health":
             return self._json(200, {"ok": True, "runtime": "runsc", "platform": RUNSC_PLATFORM,
                                     "mock": MOCK, "capacity": _capacity()})
+        if self.path == "/debug/env":
+            return self._json(200, _debug_env())
         if self.path == "/capacity":
             return self._json(200, _capacity())
         if self.path == "/vms":
