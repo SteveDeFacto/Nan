@@ -22,7 +22,7 @@ gpus: 1            # whole H200 attached to the enclave (CC allows 1 or 8)
 containers:
   # --- MPS daemon: makes per-tenant SM%/VRAM caps enforceable in prod -----------
   - name: "mps-control"
-    image: "ghcr.io/stevedefacto/nan-mps@sha256:64762476d2d9e3af629f43e621ba7327e60166520f1e561f05046a2bf69dd152"
+    image: "ghcr.io/stevedefacto/nan-mps@sha256:dad020508ab18a9e0b11224c0d4c7331491f311ff1c46064ba2c20e8a0c1c2d9"
     runtime: nvidia
     gpus: all
     ipc: host
@@ -39,7 +39,7 @@ containers:
 
   # --- GPU worker: forks MPS-capped CUDA processes per tenant, runs submitted jobs
   - name: "worker"
-    image: "ghcr.io/stevedefacto/nan-worker@sha256:984678e495d94d65633162d7939341a00c48f346e8ee364b1b79e406be335a2f"
+    image: "ghcr.io/stevedefacto/nan-worker@sha256:9bd15ac3f074067057eb5d39ab90122274828e6d1f849df4cdf91f2e5a9e4374"
     runtime: nvidia
     gpus: all
     ipc: host
@@ -59,14 +59,14 @@ containers:
 
   # --- supervisor: control plane (no GPU), public ingress -----------------------
   - name: "supervisor"
-    image: "ghcr.io/stevedefacto/nan@sha256:bf1832369b1c522a1748c34e5450e2bae58d533afb151b6f37738de73c0367db"
+    image: "ghcr.io/stevedefacto/nan@sha256:771e0c50ec38f59b8d68f4acce48017b3106c4c40a2335c221da683e620d2b3e"
     restart: always
     env:
       - PORT: "8080"
       - WORKER_URL: "http://localhost:8090"              # GPU worker (PTX submission backend)
-      # CPU docker-container hosting: provision each customer image as a QEMU microVM.
-      - PROVISION_BACKEND: "vm"                          # "vm" = CPU container hosting; "worker" = GPU PTX
-      - VMMGR_URL: "http://localhost:8091"               # the microVM manager (container below)
+      # tenant-app hosting: the wasm-manager runs each app as a `wasmtime serve` process.
+      - PROVISION_BACKEND: "vm"                          # "vm" = wasm app hosting (wasm-manager); "worker" = GPU PTX
+      - VMMGR_URL: "http://localhost:8091"               # the wasm-manager (container below); "vm"/VMMGR names are legacy
       - PUBLIC_URL: ""                                  # empty: supervisor derives its origin per-request from the Host header (handles enclave1..N with one config). Verify the returned network.endpoint on first deploy.
       - SIWE_DOMAIN: "nan.host"
       - SIWE_URI: "https://nan.host"
@@ -114,7 +114,7 @@ containers:
   # The app catalog is baked into the image (apps/*.wasm + catalog.json), so what
   # runs is exactly what Tinfoil attested. Apps are wasi:http components.
   - name: "wasm-manager"
-    image: "ghcr.io/stevedefacto/nan-wasm-manager@sha256:b5e9779d7a774aa9c8a587fd2def8893f38849a5bbc1f9063105d1d951e1a96a"
+    image: "ghcr.io/stevedefacto/nan-wasm-manager@sha256:abf72e8641a462ab360959ed6d47a99ddbb67b13ee077eff6458bd0137c68679"
     restart: always
     env:
       - WASM_MANAGER_PORT: "8091"   # same port the supervisor's VMMGR_URL already targets
@@ -136,5 +136,5 @@ shim:
     - /v1/*
     - /availability
     - /x/*
-    # microVM deploys need NO new shim path: /v1/vms/* falls under /v1/* (the
-    # supervisor proxies it to the wasm-manager on :8091), and a container's server is reached via /x/*.
+    # app deploys need NO new shim path: /v1/vms/* falls under /v1/* (the
+    # supervisor proxies it to the wasm-manager on :8091), and the app's server is reached via /x/*.

@@ -74,8 +74,9 @@ const WORKER_PIDS     = process.env.WORKER_PIDS || "512";
 // containers itself (Tinfoil forbids runtime container creation). Reachable over
 // the enclave-local network; default loopback.
 const WORKER_MGR_URL  = (process.env.WORKER_MGR_URL || "http://127.0.0.1:8090").replace(/\/+$/, "");
-// provisioning backend: "worker" = GPU PTX submission (default), "vm" = CPU docker
-// container hosting via the microVM manager (boots the customer's image as a QEMU VM).
+// provisioning backend: "worker" = GPU PTX submission (default), "vm" = tenant-app
+// hosting via the app manager on VMMGR_URL (the wasm-manager runs each app as a
+// `wasmtime serve` process). The "vm"/VMMGR_URL names are legacy, kept for config compat.
 const PROVISION_BACKEND = (process.env.PROVISION_BACKEND || "worker").toLowerCase();
 const VMMGR_URL = (process.env.VMMGR_URL || "http://127.0.0.1:8091").replace(/\/+$/, "");
 function mgrReq(method, path, body, timeoutMs = 120000) {
@@ -98,7 +99,7 @@ async function mgrHealth(timeoutMs = 3000) {
   return r.body;
 }
 
-// --- microVM manager client (CPU docker container hosting backend) -----------
+// --- app manager client ("vm" backend on VMMGR_URL; the wasm-manager) --------
 function vmReq(method, path, body, timeoutMs = 120000) {
   return new Promise((resolve, reject) => {
     const u = new URL(VMMGR_URL + path);
@@ -383,8 +384,8 @@ function sshAccessOf(rec) {
 }
 
 // ============================================================================
-// >>> IMPLEMENT THESE for your CVM launch mechanism (docker socket / nested
-//     microVM / namespaces). Contract: one ingress port, no sibling reach,
+// >>> IMPLEMENT THESE for your CVM launch mechanism (e.g. the app manager on
+//     VMMGR_URL). Contract: one ingress port, no sibling reach,
 //     and BEFORE launch extend a TDX RTMR with image.digest so getMeasurements()
 //     is honest. If the CVM can't extend an RTMR from the guest, attestation
 //     covers this supervisor only - say so in /attestation rather than implying
@@ -463,8 +464,8 @@ async function dockerPull(ref) {
 }
 
 async function spawnContainer({ deploymentId, gpu, image, share, appPort }) {
-  // Two backends. "vm": boot the customer's image as a QEMU microVM via the
-  // microVM manager (CPU docker container hosting). "worker": fork an MPS-capped
+  // Two backends. "vm": hand the app reference to the app manager on VMMGR_URL
+  // (the wasm-manager runs it as a `wasmtime serve` process). "worker": fork an MPS-capped
   // CUDA child PROCESS (GPU PTX submission). One proportional `share` sets the cap.
   const shareOf = (g) => Math.min(1, Math.max(MIN_COMPUTE_PCT / 100,
                                               g.vramCapGb / CARD_VRAM_GB, g.computeShare));
@@ -566,8 +567,8 @@ app.use("/x/:id", async (req, res) => {
   if (rec.owner !== addr) return fail(res, 403, "forbidden", "Not your deployment.");
   if (rec.status !== "running") return fail(res, 409, "not_running", `Deployment is ${rec.status}.`);
 
-  // vm backend: proxy to the customer's container port, forwarded to the VM by
-  // QEMU on shared localhost. worker backend: /x/:id/<sub> -> /tenants/:id/<sub>.
+  // vm backend: proxy to the app's loopback port on the app manager, on shared
+  // localhost. worker backend: /x/:id/<sub> -> /tenants/:id/<sub>.
   const sub = req.url.replace(/^\/+/, "");
   let target;
   if (PROVISION_BACKEND === "vm") {
