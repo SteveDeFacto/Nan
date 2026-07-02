@@ -1120,6 +1120,24 @@
             "type": "boolean",
             "default": false,
             "description": "If true, anyone can reach the app's data path (`/x/{id}/*`) with no authentication — for hosting public websites, APIs, and servers. If false (default), only the owner's SIWE bearer token can reach it. SSH and management endpoints are always owner-only regardless. Confidentiality is unaffected: the TEE still hides the app from the operator; `public` only governs who may send it requests."
+          },
+          "firewall": {
+            "type": "object",
+            "description": "Ports the app may bind, from its catalog version's firewall config (the store's Use-in-Deploy prefills this). Entries: `http` (default — standard wasi:http web app), `http:N` (app serves HTTP on N itself), `tcp:N`, `udp:N`; N in 1024-19999 excluding 8080/8091. Omitted/empty = standard web app with NO socket capability. When ports are declared the app gets wasi:sockets and the enclave audits its binds — binding an undeclared port kills the app. Declared TCP ports are reached through the attested origin as a WebSocket bridge at `/x/{id}/tcp/{port}` (auth follows `public`).",
+            "properties": {
+              "ports": {
+                "type": "array",
+                "maxItems": 8,
+                "items": {
+                  "type": "string",
+                  "pattern": "^(http|http:\\d{1,5}|tcp:\\d{1,5}|udp:\\d{1,5})$"
+                },
+                "example": [
+                  "tcp:5432",
+                  "udp:9053"
+                ]
+              }
+            }
           }
         },
         "example": {
@@ -1232,6 +1250,13 @@
           },
           "payment": {
             "$ref": "#/components/schemas/PaymentInstructions"
+          },
+          "firewall": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Normalized firewall config this deployment runs with ([] = standard web app). Declared TCP ports are bridgeable at /x/{id}/tcp/{port}."
           }
         }
       },

@@ -463,7 +463,7 @@ async function dockerPull(ref) {
   if (err) throw new Error(`pull ${ref}: ${err.error}`);
 }
 
-async function spawnContainer({ deploymentId, gpu, image, share, appPort }) {
+async function spawnContainer({ deploymentId, gpu, image, share, appPort, ports }) {
   // Two backends. "vm": hand the app reference to the app manager on VMMGR_URL
   // (the wasm-manager runs it as a `wasmtime serve` process). "worker": fork an MPS-capped
   // CUDA child PROCESS (GPU PTX submission). One proportional `share` sets the cap.
@@ -479,7 +479,7 @@ async function spawnContainer({ deploymentId, gpu, image, share, appPort }) {
     if (!ref) throw new Error("VM backend requires an image reference.");
     const s = (share != null) ? share : (gpu ? shareOf(gpu) : 0.1);
     const r = await vmReq("POST", "/vms",
-      { image: ref, share: s, appPort: appPort || 8080, name: deploymentId }, SPAWN_TIMEOUT_MS);
+      { image: ref, share: s, appPort: appPort || 8080, name: deploymentId, ports: ports || [] }, SPAWN_TIMEOUT_MS);
     if (r.status !== 201)
       throw new Error(`vmmanager: ${r.body.error || r.body.message || r.status}`);
     console.log(`[spawn-vm] ${deploymentId} image=${ref} share=${s} `
@@ -569,6 +569,30 @@ async function addrFromAuth(req) {
 // DATA PATH - registered BEFORE express.json() so the body streams untouched.
 // Same token, same origin as control; supervisor checks ownership, then proxies.
 // ---------------------------------------------------------------------------
+// Firewall config validation. Mirrors the wasm-manager's rules so a bad spec fails
+// fast at create (422) instead of at provision: entries are "http" (default serve
+// mode) | "http:N" | "tcp:N" | "udp:N"; N in 1024..19999, excluding infra ports
+// (8080 supervisor, 8091 manager) and the manager-assigned serve range (20000+).
+const FW_MIN = 1024, FW_MAX = 19999, FW_RESERVED = new Set([8080, 8091]);
+function parseFirewall(fw) {
+  const raw = (fw && Array.isArray(fw.ports)) ? fw.ports : [];
+  if (raw.length > 8) throw new Error("firewall.ports: at most 8 entries.");
+  const out = [];
+  for (const e of raw) {
+    const s = String(e).trim().toLowerCase();
+    if (!s || s === "http") continue;                       // default serve mode marker
+    const m = /^(http|tcp|udp):(\d{1,5})$/.exec(s);
+    if (!m) throw new Error(`firewall.ports: bad entry "${e}" (use http[:N] | tcp:N | udp:N).`);
+    const p = +m[2];
+    if (p < FW_MIN || p > FW_MAX || FW_RESERVED.has(p))
+      throw new Error(`firewall.ports: port ${p} not allowed (${FW_MIN}-${FW_MAX}, excluding ${[...FW_RESERVED].join("/")}).`);
+    if (!out.includes(m[1] + ":" + p)) out.push(m[1] + ":" + p);
+  }
+  if (out.filter((x) => x.startsWith("http:")).length > 1) throw new Error("firewall.ports: only one http:N entry.");
+  return out;                                               // [] = classic wasi:http serve mode
+}
+const fwTcpPorts = (rec) => (rec.firewall || []).filter((x) => x.startsWith("tcp:")).map((x) => +x.slice(4));
+
 app.use("/x/:id", async (req, res) => {
   const rec = deployments.get(req.params.id);
   if (!rec) return fail(res, 404, "not_found", "Unknown deployment.");
@@ -587,7 +611,11 @@ app.use("/x/:id", async (req, res) => {
   const sub = req.url.replace(/^\/+/, "");
   let target;
   if (PROVISION_BACKEND === "vm") {
-    if (!rec._vmHostPort) return fail(res, 502, "vm_not_ready", "The VM has no forwarded port yet.");
+    if (!rec._vmHostPort) {
+      return (rec.firewall && rec.firewall.length && !rec.firewall.some((x) => x.startsWith("http")))
+        ? fail(res, 502, "no_http", "This app exposes raw TCP/UDP ports, not HTTP. Reach declared TCP ports via the WebSocket bridge at /x/:id/tcp/:port (e.g. websocat).")
+        : fail(res, 502, "vm_not_ready", "The VM has no forwarded port yet.");
+    }
     target = new URL(`http://127.0.0.1:${rec._vmHostPort}/${sub}`);
   } else {
     target = new URL(`${WORKER_MGR_URL}/tenants/${encodeURIComponent(req.params.id)}/${sub}`);
@@ -779,6 +807,13 @@ app.post("/v1/deployments", authed, async (req, res) => {
   // either way. Confidentiality is unchanged — the TEE still hides the app from the
   // operator; "public" only governs who may send it requests.
   const isPublic = b.public === true || b.public === "true";
+  // Firewall: the app's per-version ports config from the catalog ("http" | "http:N"
+  // | "tcp:N" | "udp:N"). The wasm-manager grants wasi:sockets and enforces that the
+  // app binds ONLY these (bind audit kills violators). Declared TCP ports are reached
+  // through the one attested origin as a WebSocket bridge at /x/:id/tcp/:port.
+  let firewall;
+  try { firewall = parseFirewall(b.firewall); }
+  catch (e) { return fail(res, 422, "invalid_spec", e.message); }
   if (b.sshPublicKey != null && !/^(ssh-ed25519|ssh-rsa|ecdsa-sha2-|sk-ssh-|sk-ecdsa-)/.test(String(b.sshPublicKey).trim()))
     return fail(res, 422, "invalid_spec", "sshPublicKey must be an OpenSSH public key (ssh-ed25519 / ssh-rsa / ecdsa / sk-*).");
 
@@ -817,7 +852,7 @@ app.post("/v1/deployments", authed, async (req, res) => {
   const id = rid("dep_");
   const payRef = keccak256(stringToBytes(id));          // the bytes32 to pass to NanPay.pay()
   const rec = {
-    id, owner: req.address, status: "awaiting_payment", public: isPublic,
+    id, owner: req.address, status: "awaiting_payment", public: isPublic, firewall,
     image, command: b.command || [],
     resources: { vramGb: slice.vramGb, computeShare: round3(slice.computeShare), share: round3(slice.computeShare), cardId: gpu.cardId },
     network: { port: appPort, protocol: "https", endpoint: `${originOf(req)}/x/${id}` },
@@ -857,7 +892,7 @@ app.post("/v1/deployments", authed, async (req, res) => {
 async function provisionTenant(rec) {
   try {
     const sp = await spawnContainer({ deploymentId: rec.id, gpu: rec._gpuSpec,
-      image: rec.image, share: rec.resources.share, appPort: rec.network.port });
+      image: rec.image, share: rec.resources.share, appPort: rec.network.port, ports: rec.firewall });
     rec._port = sp.internalPort; rec._sshPort = sp.sshPort;
     if (sp.vmId) { rec._vmId = sp.vmId; rec._vmHostPort = sp.hostPort; }
     rec.startedAt = Date.now(); rec.status = "running";
@@ -1031,19 +1066,10 @@ async function authUpgrade(req) {
   try { const { payload } = await jwtVerify(token, SECRET); return getAddress(payload.sub); } catch { return null; }
 }
 
-server.on("upgrade", async (req, socket, head) => {
-  const m = (req.url || "").match(/^\/x\/([^/?]+)\/ssh(?:\?|$)/);
-  if (!m) { socket.destroy(); return; }
-  const rec  = deployments.get(m[1]);
-  const addr = await authUpgrade(req);
-  const deny = (line) => { socket.write(`HTTP/1.1 ${line}\r\n\r\n`); socket.destroy(); };
-  if (!rec || !rec._sshPort)     return deny("404 Not Found");
-  if (!addr)                     return deny("401 Unauthorized");
-  if (rec.owner !== addr)        return deny("403 Forbidden");
-  if (rec.status !== "running")  return deny("409 Conflict");
+// bridge a WebSocket to a local TCP port, binary frames both ways
+function wsTcpBridge(req, socket, head, port) {
   wss.handleUpgrade(req, socket, head, (ws) => {
-    // bridge ws <-> sandbox sshd (raw TCP). Binary frames in both directions.
-    const tcp = net.connect(rec._sshPort, "127.0.0.1");
+    const tcp = net.connect(port, "127.0.0.1");
     const close = () => { try { ws.close(); } catch {} try { tcp.destroy(); } catch {} };
     tcp.on("connect", () => {
       ws.on("message", (d) => tcp.write(d));
@@ -1052,6 +1078,43 @@ server.on("upgrade", async (req, socket, head) => {
     ws.on("close", close); ws.on("error", close);
     tcp.on("close", close); tcp.on("error", close);
   });
+}
+
+server.on("upgrade", async (req, socket, head) => {
+  const deny = (line) => { socket.write(`HTTP/1.1 ${line}\r\n\r\n`); socket.destroy(); };
+
+  // ---- app TCP ports: /x/:id/tcp/:port — the declared-firewall data path ----
+  // Auth follows the deployment's `public` flag (like the HTTP path). Two gates
+  // before bridging: the port must be DECLARED in the firewall config, and the
+  // manager must confirm THIS app actually bound it (boundPorts) — otherwise a
+  // tenant could declare-but-not-bind a port and bridge into a sibling's socket.
+  const t = (req.url || "").match(/^\/x\/([^/?]+)\/tcp\/(\d{1,5})(?:\?|$)/);
+  if (t) {
+    const rec = deployments.get(t[1]), port = +t[2];
+    if (!rec)                                 return deny("404 Not Found");
+    if (!fwTcpPorts(rec).includes(port))      return deny("404 Not Found");
+    if (!rec.public) {
+      const addr = await authUpgrade(req);
+      if (!addr)              return deny("401 Unauthorized");
+      if (rec.owner !== addr) return deny("403 Forbidden");
+    }
+    if (rec.status !== "running" || !rec._vmId) return deny("409 Conflict");
+    const vr = await vmReq("GET", `/vms/${encodeURIComponent(rec._vmId)}`).catch(() => null);
+    const bound = (vr && vr.body && vr.body.boundPorts) || [];
+    if (!bound.includes(port)) return deny("409 Conflict");   // app hasn't bound it (yet)
+    return wsTcpBridge(req, socket, head, port);
+  }
+
+  // ---- SSH: always owner-only, regardless of `public` ----
+  const m = (req.url || "").match(/^\/x\/([^/?]+)\/ssh(?:\?|$)/);
+  if (!m) { socket.destroy(); return; }
+  const rec  = deployments.get(m[1]);
+  const addr = await authUpgrade(req);
+  if (!rec || !rec._sshPort)     return deny("404 Not Found");
+  if (!addr)                     return deny("401 Unauthorized");
+  if (rec.owner !== addr)        return deny("403 Forbidden");
+  if (rec.status !== "running")  return deny("409 Conflict");
+  wsTcpBridge(req, socket, head, rec._sshPort);
 });
 
 server.listen(PORT, () => console.log(`nan supervisor on :${PORT} · ${GPU_COUNT}×GPU @ ${CARD_VRAM_GB}GB (arbitrary split) · ssh host key ${SSH_HOST_KEY_FP}`));

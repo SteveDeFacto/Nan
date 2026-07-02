@@ -166,6 +166,14 @@ Manager env: `IPFS_GATEWAY` (default `https://ipfs.nan.host`), `WASM_MAX_BYTES`
   history, hidden by readers).
 - **Global CID uniqueness**: a wasm artifact is listed at most once across the whole
   catalog, so a CID maps unambiguously to one app/version.
+- **Per-version firewall config** (`Version.ports`): a CSV of ports the release may
+  bind — `http:N` / `tcp:N` / `udp:N` (empty = standard wasi:http web app). It can
+  change from version to version. The store's **Use in Deploy** defaults the
+  deployment's firewall from it; the enclave's wasm-manager grants wasi:sockets
+  only when ports are declared, audits actual binds, and kills an app that binds
+  an undeclared port. Declared range is 1024-19999 (8080/8091 infra-reserved);
+  declared TCP ports are reached through the attested origin as a WebSocket
+  bridge at `/x/{id}/tcp/{port}`.
 - `verified` is an OPTIONAL owner-curated signal, set **per version** (you verify a
   specific CID; a new release starts unverified and must be re-checked). It does
   **not** gate execution — the CID does. The site can filter to verified.

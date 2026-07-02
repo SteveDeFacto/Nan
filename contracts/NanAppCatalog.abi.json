@@ -429,6 +429,11 @@
             "internalType": "bool",
             "name": "yanked",
             "type": "bool"
+          },
+          {
+            "internalType": "string",
+            "name": "ports",
+            "type": "string"
           }
         ],
         "internalType": "struct NanAppCatalog.Version",
@@ -490,6 +495,11 @@
             "internalType": "bool",
             "name": "yanked",
             "type": "bool"
+          },
+          {
+            "internalType": "string",
+            "name": "ports",
+            "type": "string"
           }
         ],
         "internalType": "struct NanAppCatalog.Version[]",
@@ -563,6 +573,11 @@
         "internalType": "uint32",
         "name": "memMb",
         "type": "uint32"
+      },
+      {
+        "internalType": "string",
+        "name": "ports",
+        "type": "string"
       }
     ],
     "name": "publishVersion",

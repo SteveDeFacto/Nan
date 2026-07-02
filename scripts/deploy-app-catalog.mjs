@@ -73,7 +73,9 @@ function compile() {
   const input = {
     language: "Solidity",
     sources: { "NanAppCatalog.sol": { content: source } },
-    settings: { optimizer: { enabled: true, runs: 200 }, outputSelection: { "*": { "*": ["abi", "evm.bytecode.object"] } } },
+    // viaIR: publishVersion's 7 params (6 dynamic) overflow the legacy codegen's
+    // calldata decoder ("stack too deep"); the IR pipeline spills to memory.
+    settings: { optimizer: { enabled: true, runs: 200 }, viaIR: true, outputSelection: { "*": { "*": ["abi", "evm.bytecode.object"] } } },
   };
   const out = JSON.parse(solc.compile(JSON.stringify(input)));
   const errs = (out.errors || []).filter((e) => e.severity === "error");

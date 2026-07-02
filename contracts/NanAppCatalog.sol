@@ -47,6 +47,9 @@ contract NanAppCatalog {
         uint64  createdAt;
         bool    verified;     // owner-curated, per version (the CID is what's checked)
         bool    yanked;       // publisher pulled this release (kept for history)
+        string  ports;        // firewall config: "" = standard web app (wasi:http serve);
+                              // else CSV of "http:N" / "tcp:N" / "udp:N" the app may bind
+                              // (per version — a release can change its port needs)
     }
 
     uint256 private constant MAX_SLUG = 40;
@@ -55,6 +58,8 @@ contract NanAppCatalog {
     uint256 private constant MAX_VER  = 32;
     uint256 private constant MAX_CID  = 100;
     uint32  private constant MAX_MEM  = 8192;
+    uint256 private constant MAX_PORTS = 96;   // CSV port spec, e.g. "http:8088,tcp:5432,udp:9053"
+                                               // (runners restrict the range; 8080/8091 are infra-reserved)
 
     address public owner;                             // sets `verified`; can hand off
     bytes32[] private _appIds;                        // every app ever created
@@ -89,11 +94,13 @@ contract NanAppCatalog {
         string calldata description,
         string calldata version,
         string calldata cid,
-        uint32 memMb
+        uint32 memMb,
+        string calldata ports
     ) external returns (bytes32 appId, uint256 index) {
         require(bytes(version).length > 0 && bytes(version).length <= MAX_VER, "version length");
         require(bytes(cid).length > 0 && bytes(cid).length <= MAX_CID, "cid length");
         require(memMb > 0 && memMb <= MAX_MEM, "memMb range");
+        require(bytes(ports).length <= MAX_PORTS, "ports length");
 
         _reserveCid(cid);
         appId = _touchApp(slug, name, description);
@@ -109,7 +116,8 @@ contract NanAppCatalog {
         Version[] storage vs = _versions[appId];
         vs.push(Version({
             cid: cid, version: version, memMb: memMb,
-            createdAt: uint64(block.timestamp), verified: false, yanked: false
+            createdAt: uint64(block.timestamp), verified: false, yanked: false,
+            ports: ports
         }));
         index = vs.length - 1;
 

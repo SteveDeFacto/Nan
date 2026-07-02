@@ -562,6 +562,10 @@ footer{border-top:1px solid var(--line-soft);background:var(--bg-1);padding:56px
           <input type="text" id="cfgImage" value="hello" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="hello  ·  my-app:1.0.0  ·  ipfs://bafy…" />
         </div>
         <div class="field">
+          <label for="cfgPorts">Firewall <span class="dim">(ports the app may bind · defaulted from the catalog by “Use in Deploy” · empty = standard web app)</span></label>
+          <input type="text" id="cfgPorts" value="" placeholder="empty · or http:8088, tcp:5432, udp:9053" spellcheck="false" autocapitalize="off" autocomplete="off" />
+        </div>
+        <div class="field">
           <label>Access <span class="dim">(who can reach the app)</span></label>
           <div class="seg" id="cfgAccess" role="group" aria-label="Endpoint access">
             <button data-public="1" class="on" type="button">Public</button>
@@ -730,6 +734,10 @@ footer{border-top:1px solid var(--line-soft);background:var(--bg-1);padding:56px
         <div>
           <label for="pubMem">Memory cap <span class="dim">(MB · 1–8192)</span></label>
           <input type="number" id="pubMem" value="128" min="1" max="8192" step="1" />
+        </div>
+        <div class="full">
+          <label for="pubPorts">Firewall ports <span class="dim">(optional · e.g. <b>http:8088, tcp:5432, udp:9053</b> · empty = standard web app · can change per version)</span></label>
+          <input type="text" id="pubPorts" maxlength="96" placeholder="empty = wasi:http web app on the standard endpoint" spellcheck="false" autocapitalize="off" autocomplete="off" />
         </div>
         <div class="full">
           <label for="pubDesc">Description <span class="dim">(≤ 500 chars)</span></label>
@@ -2025,6 +2033,24 @@ const SPEC = {
             "type": "string",
             "example": "auto"
           },
+          "firewall": {
+                    "type": "object",
+                    "description": "Ports the app may bind, from its catalog version's firewall config (the store's Use-in-Deploy prefills this). Entries: `http` (default — standard wasi:http web app), `http:N` (app serves HTTP on N itself), `tcp:N`, `udp:N`; N in 1024-19999 excluding 8080/8091. Omitted/empty = standard web app with NO socket capability. When ports are declared the app gets wasi:sockets and the enclave audits its binds — binding an undeclared port kills the app. Declared TCP ports are reached through the attested origin as a WebSocket bridge at `/x/{id}/tcp/{port}` (auth follows `public`).",
+                    "properties": {
+                              "ports": {
+                                        "type": "array",
+                                        "maxItems": 8,
+                                        "items": {
+                                                  "type": "string",
+                                                  "pattern": "^(http|http:\\d{1,5}|tcp:\\d{1,5}|udp:\\d{1,5})$"
+                                        },
+                                        "example": [
+                                                  "tcp:5432",
+                                                  "udp:9053"
+                                        ]
+                              }
+                    }
+          },
           "public": {
             "type": "boolean",
             "default": false,
@@ -2057,6 +2083,13 @@ const SPEC = {
           },
           "status": {
             "$ref": "#/components/schemas/DeploymentStatus"
+          },
+          "firewall": {
+                    "type": "array",
+                    "items": {
+                              "type": "string"
+                    },
+                    "description": "Normalized firewall config this deployment runs with ([] = standard web app). Declared TCP ports are bridgeable at /x/{id}/tcp/{port}."
           },
           "public": {
             "type": "boolean",
@@ -3162,7 +3195,8 @@ function fmtDur(s){
    and hand the enclave the app's `ipfs://<cid>` (unique because version labels are
    unique per app). Baked-in ids ("hello"), bare CIDs and explicit ipfs://<cid> pass
    through. Returns {reference, label?, error?, pending?}. */
-const REF_CACHE = {};   // friendly "slug:version" -> "ipfs://<cid>" (filled by Use-in-Deploy + lookups)
+const REF_CACHE = {};    // friendly "slug:version" -> "ipfs://<cid>" (filled by Use-in-Deploy + lookups)
+const PORTS_CACHE = {};  // friendly "slug:version" -> that version's firewall CSV (defaults the deploy)
 function looksFriendly(s){ return s.includes(":") && !s.startsWith("ipfs://"); }
 function resolveAppRef(input){
   input = (input || "").trim();
@@ -3184,6 +3218,7 @@ function resolveAppRef(input){
   const v = apps[0].versions.find(x => x.version === version && !x.yanked);
   if (!v) return { reference: input, label: input, error: "'" + slug + "' has no live version '" + version + "'." };
   REF_CACHE[input] = "ipfs://" + v.cid;
+  PORTS_CACHE[input] = v.ports || "";
   return { reference: REF_CACHE[input], label: input };
 }
 function deployBody(){
@@ -3192,6 +3227,9 @@ function deployBody(){
   // a friendly slug:version by resolveAppRef().
   const body = { image: { reference: resolveAppRef($("#cfgImage").value).reference } };
   body.public = dep.public;   // public endpoint (anyone) vs private (owner token only)
+  // firewall: ports the app may bind (from the catalog via Use-in-Deploy; editable)
+  const fw = ($("#cfgPorts") && $("#cfgPorts").value || "").split(",").map(x => x.trim().toLowerCase()).filter(Boolean);
+  if (fw.length && !(fw.length === 1 && fw[0] === "http")) body.firewall = { ports: fw };
   body.resources = (dep.sharePct > 0)
     ? { share: Math.min(1, Math.max(0.01, Math.round(dep.sharePct) / 100)) }
     : {};
@@ -3303,6 +3341,8 @@ async function runDeploy(){
   const rref = resolveAppRef(raw);
   if (rref.error){ termLine(term, "warn", "[!] " + rref.error); return; }
   if (rref.pending){ termLine(term, "warn", "[!] couldn’t reach the catalog to resolve " + raw + " — open the Apps tab, or paste ipfs://<cid>."); return; }
+  const fwErr = validPortsCsv($("#cfgPorts") ? $("#cfgPorts").value : "");
+  if (fwErr){ termLine(term, "warn", "[!] firewall: " + fwErr); return; }
   const body = deployBody();
   const fund = parseFloat($("#cfgBudget").value) || 0;
   const dry = $("#dryRun") && $("#dryRun").checked;
@@ -3522,11 +3562,12 @@ function initDeploy(){
     renderAccessNote(); renderDeploy();
   });
   renderAccessNote();
-  ["#cfgImage", "#cfgBudget"].forEach(s => { const el = $(s); if (el) el.addEventListener("input", renderDeploy); });
+  ["#cfgImage", "#cfgBudget", "#cfgPorts"].forEach(s => { const el = $(s); if (el) el.addEventListener("input", renderDeploy); });
   $$(".console-tabs button").forEach(b => b.addEventListener("click", () => switchPane(b.dataset.pane)));
   $("#deployBtn").addEventListener("click", runDeploy);
   $("#resetBtn").addEventListener("click", () => {
     $("#cfgImage").value = "hello";
+    const fp0 = $("#cfgPorts"); if (fp0) fp0.value = "";
     $("#cfgBudget").value = "10";
     $("#cfgShare").value = "25"; dep.sharePct = 25; dep.asset = "USDC"; dep.public = true;
     $$("#cfgAsset button").forEach(x => x.classList.toggle("on", x.dataset.asset === "USDC"));
@@ -3801,7 +3842,7 @@ function initViews(){
    Publishing is one Base tx through the injected wallet, reusing the
    same hand-rolled ABI codec as the pay flow (no web3 lib on-page).
    ============================================================ */
-const APP_CATALOG_ADDRESS = "0xA83269936FC060f9fc03180070AFdc263194AE2e"; // NanAppCatalog on Base — written automatically by scripts/deploy-app-catalog.mjs
+const APP_CATALOG_ADDRESS = "0x946bBa60b7A8DeE47279D9f8556256fbC1604e6D"; // NanAppCatalog on Base — written automatically by scripts/deploy-app-catalog.mjs
 const APP_CATALOG_CHAIN   = 8453;                        // Base mainnet (kept in sync by the deploy script; 84532 = Base Sepolia)
 const APP_CATALOG_RPC     = "https://mainnet.base.org";  // read-only eth_call endpoint; browsing needs no wallet (CORS-enabled)
 const IPFS_UPLOAD_URL      = "https://ipfs.nan.host/add-wasm"; // validating upload gateway (server validates + pins); empty => paste-a-CID only
@@ -3811,7 +3852,7 @@ const MAX_WASM_BYTES      = MAX_WASM_MB * 1024 * 1024;
 
 const CAT_SEL = {
   appCount:"b55ca2c3", getAppsPage:"a0483de1", getVersionsPage:"2eb7c1f0", owner:"8da5cb5b",
-  publishVersion:"7535857a", setActive:"9e4b5d56", yankVersion:"345c52dc", setVerified:"4ca171e5",
+  publishVersion:"2936ec7d", setActive:"9e4b5d56", yankVersion:"345c52dc", setVerified:"4ca171e5",
 };
 const CAT_MAX = { slug:40, name:80, desc:500, version:32, cid:100, mem:8192 };
 const APP_SCHEMA = [
@@ -3819,8 +3860,20 @@ const APP_SCHEMA = [
   {k:"description",t:"str"},{k:"versionCount",t:"uint"},{k:"createdAt",t:"uint"},{k:"updatedAt",t:"uint"},{k:"active",t:"bool"},
 ];
 const VER_SCHEMA = [
-  {k:"cid",t:"str"},{k:"version",t:"str"},{k:"memMb",t:"uint"},{k:"createdAt",t:"uint"},{k:"verified",t:"bool"},{k:"yanked",t:"bool"},
+  {k:"cid",t:"str"},{k:"version",t:"str"},{k:"memMb",t:"uint"},{k:"createdAt",t:"uint"},{k:"verified",t:"bool"},{k:"yanked",t:"bool"},{k:"ports",t:"str"},
 ];
+// firewall entry: http (default web app) | http:N | tcp:N | udp:N, N in 1024-19999
+// (8080/8091 are infra-reserved; the enclave enforces the same rules server-side)
+const FW_ENTRY_RE = /^(http|http:\d{1,5}|tcp:\d{1,5}|udp:\d{1,5})$/;
+function validPortsCsv(s){
+  const parts = String(s || "").split(",").map(x => x.trim().toLowerCase()).filter(Boolean);
+  for (const p of parts){
+    if (!FW_ENTRY_RE.test(p)) return "bad port spec '" + p + "' (use http[:N], tcp:N, udp:N)";
+    const n = p.includes(":") ? +p.split(":")[1] : 0;
+    if (n && (n < 1024 || n > 19999 || n === 8080 || n === 8091)) return "port " + n + " not allowed (1024-19999, excluding 8080/8091)";
+  }
+  return null;
+}
 const STORE = { apps:[], byId:{}, sel:{}, owner:null, filter:"all", loaded:false, loading:false };
 
 const blen = (s) => new TextEncoder().encode(s || "").length;
@@ -3959,7 +4012,9 @@ function appCard(app){
     + '<div class="app-head"><h3>' + esc(app.name) + '</h3>' + badge + '</div>'
     + '<p class="app-desc">' + (app.description ? esc(app.description) : '<span class="dim">no description</span>') + '</p>'
     + '<div class="app-metaline"><span title="publisher (msg.sender)">' + short(app.publisher) + '</span><span>·</span><span>' + app.versions.length + (app.versions.length === 1 ? ' version' : ' versions') + '</span></div>'
-    + '<div class="app-verrow"><span class="vlbl">version</span><select class="ver-select" aria-label="Version">' + opts + '</select><span>' + v.memMb + ' MB</span>' + (v.yanked ? '<span class="vyank">yanked</span>' : '') + '</div>'
+    + '<div class="app-verrow"><span class="vlbl">version</span><select class="ver-select" aria-label="Version">' + opts + '</select><span>' + v.memMb + ' MB</span>'
+    + (v.ports ? '<span class="vlbl" title="firewall config: ports this version may bind">⛨ ' + esc(v.ports) + '</span>' : '')
+    + (v.yanked ? '<span class="vyank">yanked</span>' : '') + '</div>'
     + '<div class="app-cid" title="IPFS content id"><code>' + esc(v.cid) + '</code><button class="copybtn" data-act="copy" data-cid="' + esc(v.cid) + '" type="button">⧉</button></div>'
     + '<div class="app-actions">'
     + '<button class="btn btn-primary btn-sm" data-act="deploy" data-cid="' + esc(v.cid) + '" type="button">Use in Deploy →</button>'
@@ -3977,10 +4032,15 @@ function refreshCard(appId){
 function useInDeploy(app, v){
   const friendly = app.slug + ":" + v.version;      // human-friendly; resolves to the CID at deploy
   REF_CACHE[friendly] = "ipfs://" + v.cid;
+  PORTS_CACHE[friendly] = v.ports || "";
   const inp = $("#cfgImage");
-  if (inp){ inp.value = friendly; if (typeof renderDeploy === "function") renderDeploy(); }
+  if (inp){ inp.value = friendly; }
+  // default this deployment's firewall from the version's catalog config (editable)
+  const fp = $("#cfgPorts");
+  if (fp){ fp.value = v.ports || ""; }
+  if (typeof renderDeploy === "function") renderDeploy();
   setView("deploy");
-  showToast("Deploy set to " + friendly + "  (ipfs://" + v.cid.slice(0, 10) + "…)");
+  showToast("Deploy set to " + friendly + (v.ports ? "  · firewall " + v.ports : "") + "  (ipfs://" + v.cid.slice(0, 10) + "…)");
 }
 
 /* ---- write side: IPFS upload + publish/verify/yank/delist txs ---- */
@@ -4047,6 +4107,7 @@ async function publishApp(){
   const slug = $("#pubSlug").value.trim(), version = $("#pubVersion").value.trim();
   const cid = $("#pubCid").value.trim(), name = $("#pubName").value.trim(), desc = $("#pubDesc").value.trim();
   const mem = parseInt($("#pubMem").value, 10) || 0;
+  const ports = $("#pubPorts").value.split(",").map(x => x.trim().toLowerCase()).filter(Boolean).join(",");
   if (!catConfigured()) return pubStatus("catalog contract address isn’t set on this site yet", true);
   if (!slug || blen(slug) > CAT_MAX.slug) return pubStatus("app slug is required (≤ 40 bytes)", true);
   if (!version || blen(version) > CAT_MAX.version) return pubStatus("version label is required (≤ 32 bytes)", true);
@@ -4054,13 +4115,15 @@ async function publishApp(){
   if (!name || blen(name) > CAT_MAX.name) return pubStatus("name is required (≤ 80 bytes)", true);
   if (blen(desc) > CAT_MAX.desc) return pubStatus("description too long (≤ 500 bytes)", true);
   if (!(mem > 0 && mem <= CAT_MAX.mem)) return pubStatus("memory must be 1–8192 MB", true);
+  if (blen(ports) > 96) return pubStatus("firewall config too long (≤ 96 bytes)", true);
+  const pErr = validPortsCsv(ports); if (pErr) return pubStatus(pErr, true);
   const btn = $("#pubSubmit"); btn.disabled = true; const lbl = btn.textContent; btn.textContent = "working…";
   try {
     if (!Nan.provider) await connectWallet();
     await ensureCatalogChain();
     pubStatus("confirm the transaction in your wallet…");
     const data = encCall(CAT_SEL.publishVersion, [
-      {t:"str",v:slug},{t:"str",v:name},{t:"str",v:desc},{t:"str",v:version},{t:"str",v:cid},{t:"uint",v:mem},
+      {t:"str",v:slug},{t:"str",v:name},{t:"str",v:desc},{t:"str",v:version},{t:"str",v:cid},{t:"uint",v:mem},{t:"str",v:ports},
     ]);
     const hash = await sendTx(APP_CATALOG_ADDRESS, data);
     pubStatus("sent · " + hash + " — waiting for confirmation…");
@@ -4086,7 +4149,7 @@ const yankTx        = (slug, idx)    => catTx(encCall(CAT_SEL.yankVersion, [{t:"
 const setVerifiedTx = (appId, idx, v) => catTx(encCall(CAT_SEL.setVerified, [{t:"bytes32",v:appId},{t:"uint",v:idx},{t:"bool",v:v}]), v ? "verifying" : "unverifying");
 
 function resetPublish(){
-  ["#pubSlug","#pubCid","#pubName","#pubDesc"].forEach(s => { const el = $(s); if (el) el.value = ""; });
+  ["#pubSlug","#pubCid","#pubName","#pubDesc","#pubPorts"].forEach(s => { const el = $(s); if (el) el.value = ""; });
   const f = $("#pubFile"); if (f) f.value = ""; const h = $("#pubFileHint"); if (h) h.textContent = "";
   $("#pubVersion").value = "1.0.0"; $("#pubMem").value = "128"; pubStatus("");
 }

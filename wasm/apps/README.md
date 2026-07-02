@@ -22,6 +22,18 @@ request and returns a response, like a serverless function. The manager owns the
 listener and binds it to a per-tenant loopback port; the app never opens its own
 socket.
 
+**Service apps (firewall ports).** A catalog version published with a firewall
+config (`http:N` / `tcp:N` / `udp:N`) runs differently: the manager launches it
+with `wasmtime run` and grants **wasi:sockets** (`-Stcp -Sudp -Sinherit-network
+-Sallow-ip-name-lookup`), and the app is a long-running *command* component that
+binds its declared ports itself (Rust `std::net` on `wasm32-wasip2` maps to
+wasi:sockets). The declared spec is passed in as `NAN_PORTS`. Enforcement: an
+audit sweep reads the app's actually-bound ports from /proc and kills it if it
+binds an undeclared port ≤19999; declared range is 1024-19999 (8080/8091
+reserved), first-come-first-served across tenants. `http:N` means "the app
+serves HTTP on N" and the supervisor proxies `/x/:id` to it; plain `tcp:N` ports
+are reached via the WebSocket bridge `/x/:id/tcp/:port` (e.g. `websocat -b`).
+
 Sandbox defaults (nothing to configure): no filesystem, no host environment, no
 network beyond the served HTTP socket, memory capped per app via `mem_mb` in the
 catalog. Peer isolation = separate Wasm sandbox + separate OS process per app.
