@@ -2024,6 +2024,11 @@ const SPEC = {
           "region": {
             "type": "string",
             "example": "auto"
+          },
+          "public": {
+            "type": "boolean",
+            "default": false,
+            "description": "If true, anyone can reach the app's data path (`/x/{id}/*`) with no authentication — for hosting public websites, APIs, and servers. If false (default), only the owner's SIWE bearer token can reach it. SSH and management endpoints are always owner-only regardless. Confidentiality is unaffected: the TEE still hides the app from the operator; `public` only governs who may send it requests."
           }
         },
         "example": {
@@ -2033,6 +2038,7 @@ const SPEC = {
           "resources": {
             "share": 0.25
           },
+          "public": true,
           "attestationPolicy": {
             "requireGpuAttestation": true
           },
@@ -2051,6 +2057,10 @@ const SPEC = {
           },
           "status": {
             "$ref": "#/components/schemas/DeploymentStatus"
+          },
+          "public": {
+            "type": "boolean",
+            "description": "Whether the app's data path is publicly reachable (no auth) or owner-only. SSH/management stay owner-only either way."
           },
           "image": {
             "$ref": "#/components/schemas/ImageRef"
