@@ -4,7 +4,7 @@
     "title": "NAN API",
     "version": "1.0.0",
     "summary": "Trustless on-demand confidential GPU compute for WebAssembly apps.",
-    "description": "Deploy a confidential WebAssembly app into a hardware-isolated enclave with an H200 in NVIDIA confidential-computing mode exposed to it. Each app is a `wasi:http` component that runs sandboxed inside the enclave: no SSH, no host filesystem, no host environment, no ambient authority — just the request/response socket the runtime hands it. The app catalog is baked into the attested enclave image, so what runs is exactly what the attestation measured. Authenticate with an Ethereum signature (SIWE), pay USDC per deployment (no accounts, no held balance), and verify the enclave yourself before you send data. Every endpoint is CORS-enabled so it can be driven directly from browser JavaScript."
+    "description": "Deploy a confidential WebAssembly app into a hardware-isolated enclave with an H200 in NVIDIA confidential-computing mode exposed to it. Each app is a `wasi:http` component that runs sandboxed inside the enclave: no SSH, no host filesystem, no host environment, no ambient authority — just the request/response socket the runtime hands it. The app catalog is baked into the attested enclave image, so what runs is exactly what the attestation measured. Authenticate with an Ethereum signature (SIWE), pay USDC or ETH per deployment (no accounts, no held balance), and verify the enclave yourself before you send data. Every endpoint is CORS-enabled so it can be driven directly from browser JavaScript."
   },
   "servers": [
     {
@@ -732,6 +732,30 @@
           },
           "note": {
             "type": "string"
+          },
+          "assets": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "example": [
+              "USDC",
+              "ETH"
+            ],
+            "description": "Accepted payment assets."
+          },
+          "payEthMethod": {
+            "type": "string",
+            "example": "payEth(bytes32 deploymentId) payable",
+            "description": "Native-ETH alternative: one payable call, no approve. The enclave watches PaidEth and credits the wei as USDC-equivalent at the live Chainlink ETH/USD rate."
+          },
+          "ethUsd": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "example": "1630.31",
+            "description": "The enclave's cached Chainlink ETH/USD read (use to size msg.value); null until first refresh."
           }
         }
       },

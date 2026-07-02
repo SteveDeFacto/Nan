@@ -22,7 +22,7 @@ gpus: 1            # whole H200 attached to the enclave (CC allows 1 or 8)
 containers:
   # --- MPS daemon: makes per-tenant SM%/VRAM caps enforceable in prod -----------
   - name: "mps-control"
-    image: "ghcr.io/stevedefacto/nan-mps@sha256:8884895d17d15c9e80b828ab7c4978119ce0501a5180ca126c91279f5f119ae0"
+    image: "ghcr.io/stevedefacto/nan-mps@sha256:72a1c7b847c888faf825cf67fbd0517d867d09f579d7547a68f23fb7b8844da8"
     runtime: nvidia
     gpus: all
     ipc: host
@@ -39,7 +39,7 @@ containers:
 
   # --- GPU worker: forks MPS-capped CUDA processes per tenant, runs submitted jobs
   - name: "worker"
-    image: "ghcr.io/stevedefacto/nan-worker@sha256:8292386aa85b5efa780299eb5337a6bfed09a4cb4a6a703f7bfc40f8e4e8e1bf"
+    image: "ghcr.io/stevedefacto/nan-worker@sha256:71081379fed8281c1e60cd10dc5079bb12c315f69b3d6b8c94c3880c24f49ed8"
     runtime: nvidia
     gpus: all
     ipc: host
@@ -59,7 +59,7 @@ containers:
 
   # --- supervisor: control plane (no GPU), public ingress -----------------------
   - name: "supervisor"
-    image: "ghcr.io/stevedefacto/nan@sha256:a9fc0600aeba0d783a047ef2b6efaf9459ebce6e289268b287323aefc2ae1abd"
+    image: "ghcr.io/stevedefacto/nan@sha256:e2c06b0a56acc193b5be3dc74c44e9c81db979898f4082c80bdf59a6f97d383d"
     restart: always
     env:
       - PORT: "8080"
@@ -77,7 +77,7 @@ containers:
       # FORWARDER_ADDRESS = deployed NanPay contract. USDC funds go straight to the
       # payout wallet set INSIDE that contract (nan.eth's cold wallet) - never here.
       # NOTE: requires outbound egress from the enclave to BASE_RPC. Confirm with Tinfoil.
-      - FORWARDER_ADDRESS: "0x149538Ea6ab1E18530B3964c648A2de7b106c561"                            # set after deploying NanPay.sol
+      - FORWARDER_ADDRESS: "0xc89Ce3768567F041593bB79B7322bb58f67afC1f"                            # set after deploying NanPay.sol
       - USDC_ADDRESS: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC on Base
       - PAYMENT_WINDOW_SEC: "600"                        # unpaid deployments release the reservation
       - GRACE_SEC: "90"                                  # grace after expiry before teardown (top-up window)
@@ -114,7 +114,7 @@ containers:
   # The app catalog is baked into the image (apps/*.wasm + catalog.json), so what
   # runs is exactly what Tinfoil attested. Apps are wasi:http components.
   - name: "wasm-manager"
-    image: "ghcr.io/stevedefacto/nan-wasm-manager@sha256:bc177e08f9a9060117031b889c662df1a2b54456a5ff1de8be197c89debea68a"
+    image: "ghcr.io/stevedefacto/nan-wasm-manager@sha256:1c61478ef92233e91d245acb84f0ca30d4b0ee4e557dd8b6f79f2c7dcd7d791f"
     restart: always
     env:
       - WASM_MANAGER_PORT: "8091"   # same port the supervisor's VMMGR_URL already targets

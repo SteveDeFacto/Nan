@@ -507,7 +507,7 @@ footer{border-top:1px solid var(--line-soft);background:var(--bg-1);padding:56px
         <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="9"/><path d="M12 7v10M9.5 9.5h4a1.8 1.8 0 010 3.6H10a1.8 1.8 0 000 3.6h4.5"/></svg></div>
         <span class="tag">no accounts</span>
         <h3>Crypto-native</h3>
-        <p>No accounts, no deposits, no custody. You pay USDC per deployment straight through to NAN; each payment buys runtime by the second, and you top up to keep an instance alive. We never hold your balance.</p>
+        <p>No accounts, no deposits, no custody. You pay USDC or ETH per deployment straight through to NAN; each payment buys runtime by the second, and you top up to keep an instance alive. We never hold your balance.</p>
       </div>
       <div class="card jade">
         <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/></svg></div>
@@ -841,7 +841,7 @@ footer{border-top:1px solid var(--line-soft);background:var(--bg-1);padding:56px
       <div class="sec-head" style="margin-bottom:0;">
         <span class="eyebrow">Reference</span>
         <h2>The NAN API</h2>
-        <p>Everything the service does, fully scoped. Authenticate with an Ethereum signature, pay USDC per deployment, and orchestrate confidential compute over plain HTTPS.</p>
+        <p>Everything the service does, fully scoped. Authenticate with an Ethereum signature, pay USDC or ETH per deployment, and orchestrate confidential compute over plain HTTPS.</p>
       </div>
       <div class="api-meta">
         <span class="chip">OpenAPI <b>3.1</b></span>
@@ -921,7 +921,7 @@ const SPEC = {
     "title": "NAN API",
     "version": "1.0.0",
     "summary": "Trustless on-demand confidential GPU compute for WebAssembly apps.",
-    "description": "Deploy a confidential WebAssembly app into a hardware-isolated enclave with an H200 in NVIDIA confidential-computing mode exposed to it. Each app is a `wasi:http` component that runs sandboxed inside the enclave: no SSH, no host filesystem, no host environment, no ambient authority — just the request/response socket the runtime hands it. The app catalog is baked into the attested enclave image, so what runs is exactly what the attestation measured. Authenticate with an Ethereum signature (SIWE), pay USDC per deployment (no accounts, no held balance), and verify the enclave yourself before you send data. Every endpoint is CORS-enabled so it can be driven directly from browser JavaScript."
+    "description": "Deploy a confidential WebAssembly app into a hardware-isolated enclave with an H200 in NVIDIA confidential-computing mode exposed to it. Each app is a `wasi:http` component that runs sandboxed inside the enclave: no SSH, no host filesystem, no host environment, no ambient authority — just the request/response socket the runtime hands it. The app catalog is baked into the attested enclave image, so what runs is exactly what the attestation measured. Authenticate with an Ethereum signature (SIWE), pay USDC or ETH per deployment (no accounts, no held balance), and verify the enclave yourself before you send data. Every endpoint is CORS-enabled so it can be driven directly from browser JavaScript."
   },
   "servers": [
     {
@@ -1643,6 +1643,9 @@ const SPEC = {
             "type": "string",
             "example": "0.0004167"
           },
+          "assets": {"type": "array", "items": {"type": "string"}, "example": ["USDC", "ETH"], "description": "Accepted payment assets."},
+          "payEthMethod": {"type": "string", "example": "payEth(bytes32 deploymentId) payable", "description": "Native-ETH alternative: one payable call, no approve. The enclave watches PaidEth and credits the wei as USDC-equivalent at the live Chainlink ETH/USD rate."},
+          "ethUsd": {"type": ["string", "null"], "example": "1630.31", "description": "The enclave's cached Chainlink ETH/USD read (use to size msg.value); null until first refresh."},
           "method": {
             "type": "string",
             "example": "pay(bytes32 deploymentId, uint256 amount)"
@@ -3293,6 +3296,7 @@ let encPoll = null;
 /* ---- minimal ABI encoding for USDC approve + NanPay pay (no web3 lib) ---- */
 const SEL_APPROVE = "095ea7b3";   // approve(address,uint256)
 const SEL_PAY     = "d0ee4de0";   // pay(bytes32,uint256)
+const SEL_PAYETH  = "00bd4dee";   // payEth(bytes32) payable — verified vs viem
 const pad32 = (h) => h.replace(/^0x/, "").toLowerCase().padStart(64, "0");
 const encAddr = (a) => pad32(a.replace(/^0x/, ""));
 const encUint = (n) => pad32(BigInt(n).toString(16));
@@ -3300,24 +3304,46 @@ const encBytes32 = (h) => { const x = h.replace(/^0x/, "").toLowerCase(); if (x.
 const usdc6 = (amt) => BigInt(Math.round(parseFloat(amt) * 1e6));
 const dataApprove = (spender, amt6) => "0x" + SEL_APPROVE + encAddr(spender) + encUint(amt6);
 const dataPay = (ref, amt6) => "0x" + SEL_PAY + encBytes32(ref) + encUint(amt6);
+const dataPayEth = (ref) => "0x" + SEL_PAYETH + encBytes32(ref);
+// USD -> wei at the enclave's quoted ETH/USD rate (an ESTIMATE for the tx amount;
+// the enclave credits the actual wei at its own live Chainlink read on arrival)
+function usdToWei(usd, ethUsd){
+  const price = parseFloat(ethUsd);
+  if (!(price > 0)) throw new NanError("No live ETH/USD rate from the enclave — pay in USDC, or retry shortly.", 0);
+  return BigInt(Math.round((usd / price) * 1e9)) * 1000000000n;   // 9dp of ETH precision
+}
 
 async function ensureBaseChain(){
   let cur;
   try { cur = await Nan.provider.request({ method: "eth_chainId" }); } catch { cur = null; }
   if (cur && String(cur).toLowerCase() === BASE_CHAIN_HEX) return;
   try { await Nan.provider.request({ method: "wallet_switchEthereumChain", params: [{ chainId: BASE_CHAIN_HEX }] }); }
-  catch(e){ throw new NanError("Switch your wallet to Base to pay in USDC.", 0); }
+  catch(e){ throw new NanError("Switch your wallet to Base to pay.", 0); }
 }
-async function sendTx(to, data){
-  return Nan.provider.request({ method: "eth_sendTransaction", params: [{ from: Nan.address, to, data, value: "0x0" }] });
+async function sendTx(to, data, value){
+  return Nan.provider.request({ method: "eth_sendTransaction", params: [{ from: Nan.address, to, data, value: value || "0x0" }] });
 }
 
-/* pay (or top up) a deployment: approve USDC to the forwarder, then call pay() */
+/* pay (or top up) a deployment.
+   USDC: approve to the forwarder, then pay(ref, amount) \u2014 two transactions.
+   ETH:  payEth(ref) with msg.value \u2014 ONE transaction; the enclave credits the wei
+         as USDC-equivalent at its live Chainlink ETH/USD read when the event lands. */
 async function payForRuntime(term, pay, fundUsdc){
   if (!pay || !pay.forwarder) throw new NanError("This enclave returned no payment instructions (forwarder not configured).", 0);
+  await ensureBaseChain();
+  if (dep.asset === "ETH"){
+    if (!pay.payEthMethod) throw new NanError("This enclave doesn't accept ETH yet (older release) \u2014 pay in USDC.", 0);
+    const wei = usdToWei(parseFloat(fundUsdc), pay.ethUsd);
+    if (wei <= 0n) throw new NanError("Enter an amount to fund.", 0);
+    const eth = (Number(wei) / 1e18).toFixed(6);
+    termLine(term, "info", "[*] payEth \u2248 " + eth + " ETH (\u2248 $" + fundUsdc + " @ $" + pay.ethUsd + "/ETH)\u2026 (wallet \u00b7 one tx, no approve)");
+    const ph = await sendTx(pay.forwarder, dataPayEth(pay.deploymentRef), "0x" + wei.toString(16));
+    termLine(term, "ok", "[\u2713] payment sent " + ph);
+    termLine(term, "dimln", "    ETH goes straight to NAN; the enclave credits it at the live Chainlink rate");
+    return ph;
+  }
   const amt6 = usdc6(fundUsdc);
   if (amt6 <= 0n) throw new NanError("Enter a USDC amount to fund.", 0);
-  await ensureBaseChain();
   termLine(term, "info", "[*] approve " + fundUsdc + " USDC to the forwarder\u2026 (wallet)");
   const ah = await sendTx(pay.usdc, dataApprove(pay.forwarder, amt6));
   termLine(term, "dimln", "    approve tx " + ah);
@@ -3351,7 +3377,9 @@ async function runDeploy(){
     termLine(term, "warn", "// dry run \u2014 nothing is sent");
     termLine(term, "p", "POST " + Nan.base + "/deployments");
     JSON.stringify(body, null, 2).split("\n").forEach(l => termLine(term, "dimln", "  " + l));
-    termLine(term, "info", "then: approve " + fund + " USDC + pay() the forwarder to fund runtime");
+    termLine(term, "info", dep.asset === "ETH"
+      ? "then: payEth() the forwarder with ≈ $" + fund + " of ETH to fund runtime (one tx)"
+      : "then: approve " + fund + " USDC + pay() the forwarder to fund runtime");
     termLine(term, "info", "uncheck \u201cDry run\u201d to deploy for real");
     return;
   }

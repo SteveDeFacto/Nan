@@ -746,20 +746,65 @@ const PAY_EVENT = { type: "event", name: "Paid", inputs: [
   { name: "deploymentId", type: "bytes32", indexed: true },
   { name: "payer",        type: "address", indexed: true },
   { name: "amount",       type: "uint256", indexed: false } ] };
+const PAY_ETH_EVENT = { type: "event", name: "PaidEth", inputs: [
+  { name: "deploymentId", type: "bytes32", indexed: true },
+  { name: "payer",        type: "address", indexed: true },
+  { name: "amountWei",    type: "uint256", indexed: false } ] };
 
 const payRefIndex = new Map();   // payRef (hex, lowercase) -> deployment id
 
 // USDC (6dp) funded at `rate` USDC/sec buys this many seconds of runtime.
 const usdcToSeconds = (amountRaw, rate) => (Number(amountRaw) / 1e6) / (rate || 1);
 
+// --- ETH payments: priced via the Chainlink ETH/USD feed on Base -------------
+// Feed address verified on-chain (description() == "ETH / USD", decimals() == 8).
+// On another chain (e.g. Base Sepolia) set ETH_USD_FEED to that chain's feed.
+const ETH_USD_FEED = process.env.ETH_USD_FEED || "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70";
+const ETH_FEED_MAX_AGE_SEC = parseInt(process.env.ETH_FEED_MAX_AGE_SEC || "21600", 10); // 6h (feed heartbeat ~20min)
+const FEED_ABI = [{ type: "function", name: "latestRoundData", stateMutability: "view", inputs: [],
+  outputs: [{ type: "uint80" }, { type: "int256" }, { type: "uint256" }, { type: "uint256" }, { type: "uint80" }] }];
+
+// wei (1e18) * price (8dp) -> USDC-equivalent (6dp):  / 1e20
+const weiToUsd6 = (wei, price8) => (wei * price8) / 10n ** 20n;
+
+let _ethUsd = { price8: null, at: 0 };            // cached oracle read (for instructions + conversion)
+async function ethUsdPrice8() {
+  if (_ethUsd.price8 && (Date.now() - _ethUsd.at) < 60_000) return _ethUsd.price8;
+  const [, answer, , updatedAt] = await chainClient.readContract({
+    address: getAddress(ETH_USD_FEED), abi: FEED_ABI, functionName: "latestRoundData" });
+  const ageSec = Math.floor(Date.now() / 1000) - Number(updatedAt);
+  if (answer <= 0n) throw new Error(`ETH/USD feed returned ${answer}`);
+  if (ageSec > ETH_FEED_MAX_AGE_SEC) throw new Error(`ETH/USD feed stale (${ageSec}s old)`);
+  _ethUsd = { price8: answer, at: Date.now() };
+  return answer;
+}
+
+// ETH payments retry if the oracle read fails: a payment must never be lost to a
+// flaky RPC. Queue drains at the top of every poll tick.
+const _pendingEth = [];
+async function onPaidEth(payRefHex, payer, wei) {
+  try {
+    const price8 = await ethUsdPrice8();
+    const usd6 = weiToUsd6(wei, price8);
+    console.log(`[pay] eth ${wei} wei @ $${(Number(price8) / 1e8).toFixed(2)} -> ${(Number(usd6) / 1e6).toFixed(2)} USDC-equiv (${payRefHex})`);
+    await onPaid(payRefHex, payer, usd6);
+  } catch (e) {
+    _pendingEth.push({ payRefHex, payer, wei });
+    console.warn(`[pay] eth payment queued for retry (${e.shortMessage || e.message})`);
+  }
+}
+
 function paymentInstructions(rec) {
   return {
-    chainId: CHAIN_ID, asset: "USDC", usdc: USDC_ADDRESS,
+    chainId: CHAIN_ID, asset: "USDC", assets: ["USDC", "ETH"], usdc: USDC_ADDRESS,
     forwarder: FORWARDER_ADDRESS || null,
-    deploymentRef: rec.payRef,                       // bytes32 to pass to pay()
+    deploymentRef: rec.payRef,                       // bytes32 to pass to pay() / payEth()
     ratePerSecondUsdc: (rec.rate || 0).toFixed(7),
     method: "pay(bytes32 deploymentId, uint256 amount)",
-    note: "approve USDC to the forwarder, then call pay(deploymentRef, amount). amount(6dp)/rate = seconds added.",
+    payEthMethod: "payEth(bytes32 deploymentId) payable",
+    ethUsd: _ethUsd.price8 ? (Number(_ethUsd.price8) / 1e8).toFixed(2) : null,   // cached Chainlink read; null until first refresh
+    note: "USDC: approve to the forwarder, then pay(deploymentRef, amount); amount(6dp)/rate = seconds. "
+        + "ETH: payEth(deploymentRef) with msg.value; credited as USDC-equivalent at the live Chainlink ETH/USD rate.",
   };
 }
 
@@ -767,7 +812,7 @@ app.get("/v1/account", authed, (req, res) => {
   const mine = [...deployments.values()].filter(d => d.owner === req.address);
   res.json({
     address: req.address, chainId: CHAIN_ID,
-    payment: { forwarder: FORWARDER_ADDRESS || null, usdc: USDC_ADDRESS, asset: "USDC" },
+    payment: { forwarder: FORWARDER_ADDRESS || null, usdc: USDC_ADDRESS, asset: "USDC", assets: ["USDC", "ETH"] },
     deployments: {
       running: mine.filter(d => d.status === "running").length,
       awaitingPayment: mine.filter(d => d.status === "awaiting_payment").length,
@@ -939,6 +984,11 @@ let _payFromBlock = null;
 async function pollPayments() {
   if (!FORWARDER_ADDRESS) return;
   try {
+    // retry ETH payments that missed an oracle read (never lose a payment)
+    if (_pendingEth.length) {
+      const q = _pendingEth.splice(0);
+      for (const p of q) await onPaidEth(p.payRefHex, p.payer, p.wei);
+    }
     const latest = await chainClient.getBlockNumber();
     if (_payFromBlock == null) { _payFromBlock = latest; return; }   // start at the tip; don't replay history
     if (latest < _payFromBlock) return;
@@ -948,14 +998,23 @@ async function pollPayments() {
       const a = lg.args || {};
       await onPaid(a.deploymentId, a.payer, a.amount);
     }
+    const ethLogs = await chainClient.getLogs({ address: getAddress(FORWARDER_ADDRESS),
+      event: PAY_ETH_EVENT, fromBlock: _payFromBlock, toBlock: latest });
+    for (const lg of ethLogs) {
+      const a = lg.args || {};
+      await onPaidEth(a.deploymentId, a.payer, a.amountWei);
+    }
     _payFromBlock = latest + 1n;
   } catch (e) { console.warn(`[pay] poll error: ${e.shortMessage || e.message}`); }
 }
 function startPaymentWatcher() {
   if (!FORWARDER_ADDRESS) { console.warn("[pay] FORWARDER_ADDRESS unset - payments disabled (deployments will sit awaiting_payment)"); return; }
-  console.log(`[pay] watching ${FORWARDER_ADDRESS} for Paid events every ${PAY_POLL_SEC}s`);
+  console.log(`[pay] watching ${FORWARDER_ADDRESS} for Paid + PaidEth events every ${PAY_POLL_SEC}s (ETH priced via ${ETH_USD_FEED})`);
   const t = setInterval(pollPayments, PAY_POLL_SEC * 1000); if (t.unref) t.unref();
   pollPayments();
+  // prime + keep the ETH/USD cache warm so payment instructions can quote ethUsd
+  ethUsdPrice8().catch((e) => console.warn(`[pay] ETH/USD feed: ${e.shortMessage || e.message}`));
+  const p = setInterval(() => ethUsdPrice8().catch(() => {}), 300_000); if (p.unref) p.unref();
 }
 
 // Tear down deployments past their funded expiry (+ grace), reclaiming the slice.

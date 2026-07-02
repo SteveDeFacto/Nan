@@ -2,7 +2,8 @@
 // deploy-nanpay.mjs - compile + deploy contracts/NanPay.sol to Base, print the
 // address, and (optionally) write it into tinfoil-config.yml as FORWARDER_ADDRESS.
 //
-// NanPay is non-custodial: it forwards USDC payer -> payout in the same tx and
+// NanPay is non-custodial: it forwards USDC (pay) or native ETH (payEth) payer ->
+// payout in the same tx and
 // holds nothing. The deployer EOA becomes `owner` (can later setPayout/setOwner).
 //
 // Deps (run from repo root):  npm i viem solc
