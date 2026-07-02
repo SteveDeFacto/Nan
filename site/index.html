@@ -587,7 +587,7 @@ footer{border-top:1px solid var(--line-soft);background:var(--bg-1);padding:56px
         </div>
         <div class="field">
           <label for="cfgBudget">Fund now <span class="dim">(USDC · buys runtime)</span></label>
-          <input type="number" id="cfgBudget" value="10" min="1" step="1" />
+          <input type="number" id="cfgBudget" value="10" min="0.01" step="any" inputmode="decimal" />
         </div>
         <div class="est">
           <span>≈ runtime this buys</span>
@@ -3302,7 +3302,10 @@ const pad32 = (h) => h.replace(/^0x/, "").toLowerCase().padStart(64, "0");
 const encAddr = (a) => pad32(a.replace(/^0x/, ""));
 const encUint = (n) => pad32(BigInt(n).toString(16));
 const encBytes32 = (h) => { const x = h.replace(/^0x/, "").toLowerCase(); if (x.length !== 64) throw new NanError("bad payment reference", 0); return x; };
-const usdc6 = (amt) => BigInt(Math.round(parseFloat(amt) * 1e6));
+// USDC has 6 decimals, but we FUND in whole cents (0.01 USDC granularity): a
+// sub-cent amount encodes as a tiny raw value that wallets render as "0 USDC"
+// (and buys no meaningful runtime), so round to cents. NaN-safe (empty field -> 0).
+const usdc6 = (amt) => BigInt(Math.round((parseFloat(amt) || 0) * 100)) * 10000n;
 const dataApprove = (spender, amt6) => "0x" + SEL_APPROVE + encAddr(spender) + encUint(amt6);
 const dataPay = (ref, amt6) => "0x" + SEL_PAY + encBytes32(ref) + encUint(amt6);
 const dataPayEth = (ref) => "0x" + SEL_PAYETH + encBytes32(ref);
@@ -3332,23 +3335,23 @@ async function sendTx(to, data, value){
 async function payForRuntime(term, pay, fundUsdc){
   if (!pay || !pay.forwarder) throw new NanError("This enclave returned no payment instructions (forwarder not configured).", 0);
   await ensureBaseChain();
+  const amt6 = usdc6(fundUsdc);                       // cent-rounded 6dp USDC
+  if (amt6 <= 0n) throw new NanError("Fund at least $0.01 (USDC).", 0);
+  const usd = (Number(amt6) / 1e6).toFixed(2);        // e.g. "10.00" \u2014 what actually gets approved/paid
   if (dep.asset === "ETH"){
     if (!pay.payEthMethod) throw new NanError("This enclave doesn't accept ETH yet (older release) \u2014 pay in USDC.", 0);
-    const wei = usdToWei(parseFloat(fundUsdc), pay.ethUsd);
-    if (wei <= 0n) throw new NanError("Enter an amount to fund.", 0);
+    const wei = usdToWei(Number(amt6) / 1e6, pay.ethUsd);
     const eth = (Number(wei) / 1e18).toFixed(6);
-    termLine(term, "info", "[*] payEth \u2248 " + eth + " ETH (\u2248 $" + fundUsdc + " @ $" + pay.ethUsd + "/ETH)\u2026 (wallet \u00b7 one tx, no approve)");
+    termLine(term, "info", "[*] payEth \u2248 " + eth + " ETH (\u2248 $" + usd + " @ $" + pay.ethUsd + "/ETH)\u2026 (wallet \u00b7 one tx, no approve)");
     const ph = await sendTx(pay.forwarder, dataPayEth(pay.deploymentRef), "0x" + wei.toString(16));
     termLine(term, "ok", "[\u2713] payment sent " + ph);
     termLine(term, "dimln", "    ETH goes straight to NAN; the enclave credits it at the live Chainlink rate");
     return ph;
   }
-  const amt6 = usdc6(fundUsdc);
-  if (amt6 <= 0n) throw new NanError("Enter a USDC amount to fund.", 0);
-  termLine(term, "info", "[*] approve " + fundUsdc + " USDC to the forwarder\u2026 (wallet)");
+  termLine(term, "info", "[*] approve " + usd + " USDC to the forwarder\u2026 (wallet)");
   const ah = await sendTx(pay.usdc, dataApprove(pay.forwarder, amt6));
   termLine(term, "dimln", "    approve tx " + ah);
-  termLine(term, "info", "[*] pay " + fundUsdc + " USDC \u2014 buys runtime\u2026 (wallet)");
+  termLine(term, "info", "[*] pay " + usd + " USDC \u2014 buys runtime\u2026 (wallet)");
   const ph = await sendTx(pay.forwarder, dataPay(pay.deploymentRef, amt6));
   termLine(term, "ok", "[\u2713] payment sent " + ph);
   termLine(term, "dimln", "    funds go straight to NAN; nothing is custodied");
