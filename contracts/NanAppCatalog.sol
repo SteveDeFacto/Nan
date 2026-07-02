@@ -62,6 +62,7 @@ contract NanAppCatalog {
     mapping(bytes32 => bool) private _exists;
     mapping(bytes32 => Version[]) private _versions;  // appId -> release history
     mapping(bytes32 => bool) private _cidUsed;        // keccak256(cid) -> already listed (global uniqueness)
+    mapping(bytes32 => bool) private _verUsed;        // keccak256(appId, version) -> label taken (per-app uniqueness)
 
     event AppCreated(bytes32 indexed appId, address indexed publisher, string slug, string name);
     event AppEdited(bytes32 indexed appId, string name, string description);
@@ -96,6 +97,14 @@ contract NanAppCatalog {
 
         _reserveCid(cid);
         appId = _touchApp(slug, name, description);
+
+        // version labels are unique within an app, so `slug:version` resolves to
+        // exactly one CID (deterministic human-friendly deploy references).
+        {
+            bytes32 vk = keccak256(abi.encodePacked(appId, version));
+            require(!_verUsed[vk], "version exists");
+            _verUsed[vk] = true;
+        }
 
         Version[] storage vs = _versions[appId];
         vs.push(Version({

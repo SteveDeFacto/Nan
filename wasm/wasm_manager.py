@@ -18,10 +18,14 @@ backend, so the supervisor needs no change:
   GET    /vms/:id | /vms | /health | /capacity | /catalog | /debug/env
 
 Notes:
-- `image` is reinterpreted as a Wasm APP REFERENCE: a catalog id (resolved to a
-  baked-in, attested .wasm under APPS_DIR) or an absolute path to a .wasm. No
-  arbitrary runtime URL fetch: the catalog is baked into the (attested) image so
-  what runs is exactly what was measured at deploy.
+- `image` is reinterpreted as a Wasm APP REFERENCE:
+    * a catalog id (baked-in, attested .wasm under APPS_DIR), or
+    * `ipfs://<cid>` — fetched from IPFS_GATEWAY and VERIFIED: we pull the DAG as a
+      CAR, check every block hashes to its CID, and reassemble the file rooted at
+      the requested CID (see ipfs_fetch.py). A tampering gateway fails the hash
+      check, so "what ran == this exact CID" holds without trusting the gateway.
+      The verified CID is what the supervisor folds into attestation.
+    * an absolute path to a .wasm already under APPS_DIR.
 - `sshHostPort` is always 0. A Wasm app is not an OS; there is nothing to SSH
   into. The supervisor already tolerates sshPort 0.
 - Apps must be wasi:http components (what `wasmtime serve` runs). A WASIX/wasmer
@@ -31,6 +35,7 @@ import http.server
 import json
 import os
 import pathlib
+import re
 import resource
 import signal
 import socket
@@ -38,6 +43,8 @@ import subprocess
 import threading
 import time
 import uuid
+
+import ipfs_fetch   # local module (same dir): fetch + verify a wasm by IPFS CID
 
 # ---- config ---------------------------------------------------------------- #
 PORT         = int(os.environ.get("WASM_MANAGER_PORT", "8091"))   # same port the supervisor expects
@@ -54,6 +61,10 @@ READY_SECS   = float(os.environ.get("WASM_READY_TIMEOUT", "20"))
 MOCK         = os.environ.get("WASM_MOCK", "") not in ("", "0", "false")
 LOG_DIR      = pathlib.Path(os.environ.get("WASM_LOG_DIR", "/tmp/nan-wasm-logs"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+# run-by-CID: fetch an app's bytes from IPFS and verify they hash to the CID.
+IPFS_GATEWAY   = os.environ.get("IPFS_GATEWAY", "https://ipfs.nan.host").rstrip("/")
+WASM_MAX_BYTES = int(os.environ.get("WASM_MAX_BYTES", str(256 * 1024 * 1024)))  # cap on a fetched app
+IPFS_TIMEOUT   = float(os.environ.get("IPFS_FETCH_TIMEOUT", "120"))
 
 _lock = threading.Lock()
 _apps = {}    # id -> record
@@ -69,9 +80,47 @@ def _load_catalog() -> dict:
         return {}
 
 
+def _check_component(data: bytes):
+    """Reject anything that isn't a wasi:http *component* before we try to run it
+    (same preamble check as the upload gateway; gives a clear error vs a wasmtime
+    crash). Layer field: 0 = core module, 1 = component."""
+    if len(data) < 8 or data[0:4] != b"\x00asm":
+        raise ValueError("fetched bytes are not a WebAssembly file")
+    layer = data[6] | (data[7] << 8)
+    if layer == 0:
+        raise ValueError("fetched a core wasm module, not a wasi:http component")
+    if layer != 1:
+        raise ValueError(f"unrecognized wasm layer {layer} (expected a component)")
+
+
+def _resolve_cid(cid: str) -> pathlib.Path:
+    """Fetch `cid` from IPFS, verify the bytes hash to it, cache under APPS_DIR, run."""
+    safe = re.sub(r"[^A-Za-z0-9]", "", cid)
+    if not safe:
+        raise ValueError(f"bad ipfs cid '{cid}'")
+    p = (APPS_DIR / f"ipfs-{safe}.wasm").resolve()
+    if p.is_file():
+        return p                                   # content-addressed cache hit
+    try:
+        data = ipfs_fetch.fetch_verified(cid, IPFS_GATEWAY, WASM_MAX_BYTES, IPFS_TIMEOUT)
+    except ValueError:
+        raise                                      # verification / size errors already have clear messages
+    except Exception as e:                          # network / gateway errors -> ValueError so launch() reports it
+        raise ValueError(f"ipfs fetch failed for {cid}: {e}")
+    _check_component(data)
+    APPS_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_bytes(data)
+    tmp.replace(p)                                  # atomic publish into the cache
+    return p
+
+
 def _resolve_wasm(ref: str) -> pathlib.Path:
-    """Resolve an app reference to a .wasm path. Catalog id first, then an
-    absolute path INSIDE APPS_DIR. Never fetches from the network."""
+    """Resolve an app reference to a .wasm path: a catalog id (baked-in, attested),
+    `ipfs://<cid>` (fetched + verified against the CID), or a path INSIDE APPS_DIR."""
+    if ref.startswith("ipfs://"):
+        cid = ref[len("ipfs://"):].split("/", 1)[0].split("?", 1)[0].strip()
+        return _resolve_cid(cid)
     cat = _load_catalog()
     if ref in cat:
         p = (APPS_DIR / cat[ref]["file"]).resolve()

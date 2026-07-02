@@ -9,8 +9,10 @@ deploy. To add an app, drop its compiled `.wasm` here and add an entry to
 > today, referenced by id (e.g. `hello`). There is a *second*, separate catalog:
 > the **on-chain community app store** (`NanAppCatalog` on Base, the **Apps** tab
 > on the site) where anyone publishes `wasi:http` apps addressed by IPFS CID. That
-> one is open discovery, not attested — see `contracts/README.md`. Run-by-CID from
-> the store is phased in; until then, deploys run from *this* baked-in catalog.
+> one is open discovery, not attested — see `contracts/README.md`. Apps from that
+> store deploy by `ipfs://<cid>` (or `slug:version`): the manager fetches the CID,
+> verifies the bytes hash to it (`ipfs_fetch.py`), and runs it. Baked-in apps here
+> are still referenced by id and covered directly by the image measurement.
 
 ## App requirements
 

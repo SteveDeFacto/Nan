@@ -135,12 +135,24 @@ browser --(publishVersion tx)---------> NanAppCatalog   one Base tx; publisher =
   hash of the exact wasm), never the bytes, so a caller fetches from any IPFS peer
   and verifies the bytes match the CID independently.
 
-**Phased run-by-CID.** The store is discovery-only for now — the Deploy console
-still runs the attested baked-in catalog. Because each listing already carries the
-CID, the planned path is `image.reference = ipfs://<cid>`: the wasm-manager fetches
-the CID, checks the bytes hash to it, and folds that hash into attestation so
-"what ran = this exact CID." The card's **Use in Deploy** button already prefills
-that reference.
+**Run-by-CID (implemented).** Uploaded apps deploy, not just browse. `image.reference`
+accepts:
+- a baked-in catalog id (`hello`),
+- `ipfs://<cid>`, or
+- a human-friendly `slug:version` (or `<publisher>/slug:version` to disambiguate) —
+  the **browser** resolves that against the on-chain catalog to the app's CID (unique
+  because version labels are unique per app) and sends `ipfs://<cid>`.
+
+The enclave's wasm-manager then fetches the CID from `IPFS_GATEWAY` as a **CAR**,
+verifies every block hashes to its CID and reassembles the file rooted at the
+requested CID (`wasm/ipfs_fetch.py`), rejects anything that isn't a wasi:http
+component, caches it under `APPS_DIR`, and runs it. A tampering gateway fails the
+hash check, so the operator's own gateway is fine to use. The verified CID is folded
+into the attestation (`getMeasurements().app.cid`), so "what ran = this exact CID"
+holds. The store card's **Use in Deploy** sets the friendly `slug:version`.
+
+Manager env: `IPFS_GATEWAY` (default `https://ipfs.nan.host`), `WASM_MAX_BYTES`
+(default 256 MiB), `IPFS_FETCH_TIMEOUT`.
 
 ## Versioning & trust model
 - An **app** is `appId = keccak256(publisher, slug)` — a slug in the publisher's own

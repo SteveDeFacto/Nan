@@ -558,8 +558,8 @@ footer{border-top:1px solid var(--line-soft);background:var(--bg-1);padding:56px
       <div class="cfg">
         <h4>App</h4>
         <div class="field">
-          <label for="cfgImage">Wasm app <span class="dim">(wasi:http component · catalog id, e.g. hello)</span></label>
-          <input type="text" id="cfgImage" value="hello" spellcheck="false" autocapitalize="off" autocomplete="off" />
+          <label for="cfgImage">Wasm app <span class="dim">(catalog id e.g. <b>hello</b>, or <b>slug:version</b>, or <b>ipfs://&lt;cid&gt;</b>)</span></label>
+          <input type="text" id="cfgImage" value="hello" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="hello  ·  my-app:1.0.0  ·  ipfs://bafy…" />
         </div>
         <div class="field">
           <label for="cfgShare">Share <span class="dim">(% of card · 1 to 100)</span> <span class="dim" id="shareCap">· checking live capacity…</span></label>
@@ -3133,11 +3133,40 @@ function fmtDur(s){
   if (m > 0) return m + "m " + s + "s";
   return s + "s";
 }
+/* Resolve what the user typed into an `image.reference` the enclave understands.
+   Humans can type "[publisher/]slug:version"; we look it up in the on-chain catalog
+   and hand the enclave the app's `ipfs://<cid>` (unique because version labels are
+   unique per app). Baked-in ids ("hello"), bare CIDs and explicit ipfs://<cid> pass
+   through. Returns {reference, label?, error?, pending?}. */
+const REF_CACHE = {};   // friendly "slug:version" -> "ipfs://<cid>" (filled by Use-in-Deploy + lookups)
+function looksFriendly(s){ return s.includes(":") && !s.startsWith("ipfs://"); }
+function resolveAppRef(input){
+  input = (input || "").trim();
+  if (!input) return { reference: "hello" };
+  if (input.startsWith("ipfs://")) return { reference: input };
+  if (/^(baf[a-z0-9]{10,}|Qm[1-9A-HJ-NP-Za-km-z]{20,})$/.test(input)) return { reference: "ipfs://" + input };  // bare CID
+  if (!looksFriendly(input)) return { reference: input };                    // baked-in catalog id
+  if (REF_CACHE[input]) return { reference: REF_CACHE[input], label: input };
+  let pub = null, rest = input;
+  const slash = input.indexOf("/");
+  if (slash >= 0){ pub = input.slice(0, slash).trim().toLowerCase(); rest = input.slice(slash + 1); }
+  const colon = rest.lastIndexOf(":");
+  const slug = rest.slice(0, colon).trim(), version = rest.slice(colon + 1).trim();
+  if (!STORE.loaded) return { reference: input, label: input, pending: true };   // catalog not read yet
+  let apps = (STORE.apps || []).filter(a => a.slug === slug && a.active);
+  if (pub) apps = apps.filter(a => a.publisher.toLowerCase() === pub);
+  if (!apps.length) return { reference: input, label: input, error: "No catalog app '" + slug + "'" + (pub ? " by " + pub : "") + "." };
+  if (apps.length > 1) return { reference: input, label: input, error: "Several publishers have '" + slug + "' — qualify it: <publisher>/" + slug + ":" + version };
+  const v = apps[0].versions.find(x => x.version === version && !x.yanked);
+  if (!v) return { reference: input, label: input, error: "'" + slug + "' has no live version '" + version + "'." };
+  REF_CACHE[input] = "ipfs://" + v.cid;
+  return { reference: REF_CACHE[input], label: input };
+}
 function deployBody(){
-  // `image.reference` is the Wasm app to run: a wasi:http component baked into
-  // the attested enclave image, selected by its catalog id (e.g. "hello").
-  const app = $("#cfgImage").value.trim() || "hello";
-  const body = { image: { reference: app } };
+  // `image.reference` is the Wasm app to run: a baked-in attested catalog id, or an
+  // ipfs://<cid> (fetched + verified against the CID by the enclave), resolved from
+  // a friendly slug:version by resolveAppRef().
+  const body = { image: { reference: resolveAppRef($("#cfgImage").value).reference } };
   body.resources = (dep.sharePct > 0)
     ? { share: Math.min(1, Math.max(0.01, Math.round(dep.sharePct) / 100)) }
     : {};
@@ -3240,6 +3269,15 @@ async function payForRuntime(term, pay, fundUsdc){
 async function runDeploy(){
   const btn = $("#deployBtn"); if (btn.disabled) return;
   const term = $("#termOut"); term.innerHTML = ""; switchPane("run");
+  // resolve a friendly slug:version -> ipfs://<cid> (may need to read the catalog first)
+  const raw = $("#cfgImage").value.trim();
+  if (looksFriendly(raw) && !REF_CACHE[raw] && !STORE.loaded){
+    termLine(term, "info", "[*] resolving " + raw + " from the catalog…");
+    try { await loadCatalog(); } catch(e){}
+  }
+  const rref = resolveAppRef(raw);
+  if (rref.error){ termLine(term, "warn", "[!] " + rref.error); return; }
+  if (rref.pending){ termLine(term, "warn", "[!] couldn’t reach the catalog to resolve " + raw + " — open the Apps tab, or paste ipfs://<cid>."); return; }
   const body = deployBody();
   const fund = parseFloat($("#cfgBudget").value) || 0;
   const dry = $("#dryRun") && $("#dryRun").checked;
@@ -3725,7 +3763,7 @@ function initViews(){
    Publishing is one Base tx through the injected wallet, reusing the
    same hand-rolled ABI codec as the pay flow (no web3 lib on-page).
    ============================================================ */
-const APP_CATALOG_ADDRESS = "0x214bcF871d4Fa9dAc8D46D0Dc4Bdce0b9eFEf65b"; // NanAppCatalog on Base — written automatically by scripts/deploy-app-catalog.mjs
+const APP_CATALOG_ADDRESS = "0xA83269936FC060f9fc03180070AFdc263194AE2e"; // NanAppCatalog on Base — written automatically by scripts/deploy-app-catalog.mjs
 const APP_CATALOG_CHAIN   = 8453;                        // Base mainnet (kept in sync by the deploy script; 84532 = Base Sepolia)
 const APP_CATALOG_RPC     = "https://mainnet.base.org";  // read-only eth_call endpoint; browsing needs no wallet (CORS-enabled)
 const IPFS_UPLOAD_URL      = "https://ipfs.nan.host/add-wasm"; // validating upload gateway (server validates + pins); empty => paste-a-CID only
@@ -3898,11 +3936,13 @@ function refreshCard(appId){
   const art = grid.querySelector('article[data-appid="' + appId + '"]'), app = STORE.byId[appId];
   if (art && app) art.outerHTML = appCard(app);
 }
-function useInDeploy(cid){
+function useInDeploy(app, v){
+  const friendly = app.slug + ":" + v.version;      // human-friendly; resolves to the CID at deploy
+  REF_CACHE[friendly] = "ipfs://" + v.cid;
   const inp = $("#cfgImage");
-  if (inp){ inp.value = "ipfs://" + cid; if (typeof renderDeploy === "function") renderDeploy(); }
+  if (inp){ inp.value = friendly; if (typeof renderDeploy === "function") renderDeploy(); }
   setView("deploy");
-  showToast("Prefilled Deploy with ipfs://" + cid.slice(0, 12) + "… · run-by-CID is rolling out; baked-in ids (e.g. hello) deploy today");
+  showToast("Deploy set to " + friendly + "  (ipfs://" + v.cid.slice(0, 10) + "…)");
 }
 
 /* ---- write side: IPFS upload + publish/verify/yank/delist txs ---- */
@@ -4051,7 +4091,7 @@ function initStore(){
     const app = STORE.byId[art.dataset.appid]; if (!app) return;
     const act = btn.dataset.act;
     if (act === "copy") copyText(btn.dataset.cid, btn);
-    else if (act === "deploy") useInDeploy(btn.dataset.cid);
+    else if (act === "deploy") useInDeploy(app, app.versions[selIdx(app)]);
     else if (act === "delist"){ if (confirm("Delist this whole app? It stays on-chain but is hidden from the store.")) setActiveTx(app.slug, false); }
     else if (act === "yank"){ const idx = parseInt(btn.dataset.idx, 10); if (confirm("Yank version " + app.versions[idx].version + "? It stays on-chain but readers hide it.")) yankTx(app.slug, idx); }
     else if (act === "verify") setVerifiedTx(app.appId, parseInt(btn.dataset.idx, 10), btn.dataset.v === "1");

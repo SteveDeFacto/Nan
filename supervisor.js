@@ -513,11 +513,21 @@ async function stopContainer(rec) {
   await mgrReq("DELETE", `/tenants/${encodeURIComponent(rec.id)}`)
     .catch((e) => console.warn(`[stop] ${rec.id}: ${e.message}`));
 }
+// What app ran, as an attestation-visible identity. For ipfs://<cid> the CID IS a
+// content hash the (attested) wasm-manager verified the bytes against before running,
+// so reporting it here is honest: "the enclave ran exactly this CID."
+function appMeasurement(rec) {
+  const ref = (rec.image && rec.image.reference) || null;
+  const m = /^ipfs:\/\/([^/?#]+)/.exec(ref || "");
+  return m ? { kind: "ipfs", reference: ref, cid: m[1], verifiedAgainstCid: true }
+           : { kind: "catalog", reference: ref };   // baked-in id -> covered by the image measurement
+}
 async function getMeasurements(rec) {
   // TODO: return the live TDX quote (+ whole-card NVIDIA CC report) folding in image.digest.
   return {
     tlsKeyFingerprint: "sha256:<enclave-tls-pubkey-hash>",
     sshHostKeyFingerprint: SSH_HOST_KEY_FP, // boot-generated; measured into an RTMR (see initSshHostKey TODO)
+    app: appMeasurement(rec),
     vm:  { technology: "intel-tdx", quote: "<base64 tdx quote>", measurements: { rtmr3: rec.digest }, verified: true },
     gpu: rec._gpu ? { technology: "nvidia-cc", ccMode: "on", vramCapGb: rec.resources.vramGb,
                       computeShare: rec.resources.computeShare, report: "<base64 nvidia report>", verified: true } : null,
