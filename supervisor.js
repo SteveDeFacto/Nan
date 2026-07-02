@@ -572,9 +572,14 @@ async function addrFromAuth(req) {
 app.use("/x/:id", async (req, res) => {
   const rec = deployments.get(req.params.id);
   if (!rec) return fail(res, 404, "not_found", "Unknown deployment.");
-  const addr = await addrFromAuth(req);
-  if (!addr) return fail(res, 401, "unauthorized", "Missing or invalid token.");
-  if (rec.owner !== addr) return fail(res, 403, "forbidden", "Not your deployment.");
+  // Public deployments serve anyone (websites/APIs). Private ones require the owner's
+  // token (checked before status so a private deployment's state isn't leaked). SSH
+  // (the WebSocket upgrade below) is ALWAYS owner-only, regardless of `public`.
+  if (!rec.public) {
+    const addr = await addrFromAuth(req);
+    if (!addr) return fail(res, 401, "unauthorized", "Missing or invalid token.");
+    if (rec.owner !== addr) return fail(res, 403, "forbidden", "Not your deployment.");
+  }
   if (rec.status !== "running") return fail(res, 409, "not_running", `Deployment is ${rec.status}.`);
 
   // vm backend: proxy to the app's loopback port on the app manager, on shared
@@ -769,6 +774,11 @@ app.post("/v1/deployments", authed, async (req, res) => {
   const b = req.body || {};
   const image = (b.image && b.image.reference) ? b.image : { reference: DEFAULT_IMAGE };
   const appPort = Number(b.port) || 8080;
+  // Public endpoint: anyone can reach the app's data path (hosting a website/API).
+  // Private (default): only the owner's SIWE token can. SSH/management stay owner-only
+  // either way. Confidentiality is unchanged — the TEE still hides the app from the
+  // operator; "public" only governs who may send it requests.
+  const isPublic = b.public === true || b.public === "true";
   if (b.sshPublicKey != null && !/^(ssh-ed25519|ssh-rsa|ecdsa-sha2-|sk-ssh-|sk-ecdsa-)/.test(String(b.sshPublicKey).trim()))
     return fail(res, 422, "invalid_spec", "sshPublicKey must be an OpenSSH public key (ssh-ed25519 / ssh-rsa / ecdsa / sk-*).");
 
@@ -807,7 +817,7 @@ app.post("/v1/deployments", authed, async (req, res) => {
   const id = rid("dep_");
   const payRef = keccak256(stringToBytes(id));          // the bytes32 to pass to NanPay.pay()
   const rec = {
-    id, owner: req.address, status: "awaiting_payment",
+    id, owner: req.address, status: "awaiting_payment", public: isPublic,
     image, command: b.command || [],
     resources: { vramGb: slice.vramGb, computeShare: round3(slice.computeShare), share: round3(slice.computeShare), cardId: gpu.cardId },
     network: { port: appPort, protocol: "https", endpoint: `${originOf(req)}/x/${id}` },
