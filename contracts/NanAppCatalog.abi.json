@@ -109,6 +109,31 @@
       },
       {
         "indexed": false,
+        "internalType": "uint8",
+        "name": "status",
+        "type": "uint8"
+      }
+    ],
+    "name": "VersionApprovalSet",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "bytes32",
+        "name": "appId",
+        "type": "bytes32"
+      },
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "index",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
         "internalType": "string",
         "name": "version",
         "type": "string"
@@ -169,6 +194,45 @@
   },
   {
     "inputs": [],
+    "name": "APPROVAL_APPROVED",
+    "outputs": [
+      {
+        "internalType": "uint8",
+        "name": "",
+        "type": "uint8"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "APPROVAL_PENDING",
+    "outputs": [
+      {
+        "internalType": "uint8",
+        "name": "",
+        "type": "uint8"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "APPROVAL_REJECTED",
+    "outputs": [
+      {
+        "internalType": "uint8",
+        "name": "",
+        "type": "uint8"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
     "name": "appCount",
     "outputs": [
       {
@@ -221,6 +285,50 @@
       }
     ],
     "stateMutability": "pure",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "string",
+        "name": "cid",
+        "type": "string"
+      }
+    ],
+    "name": "cidStatus",
+    "outputs": [
+      {
+        "internalType": "bool",
+        "name": "listed",
+        "type": "bool"
+      },
+      {
+        "internalType": "bytes32",
+        "name": "appId",
+        "type": "bytes32"
+      },
+      {
+        "internalType": "uint256",
+        "name": "index",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint8",
+        "name": "approval",
+        "type": "uint8"
+      },
+      {
+        "internalType": "bool",
+        "name": "yanked",
+        "type": "bool"
+      },
+      {
+        "internalType": "bool",
+        "name": "appActive",
+        "type": "bool"
+      }
+    ],
+    "stateMutability": "view",
     "type": "function"
   },
   {
@@ -434,6 +542,11 @@
             "internalType": "string",
             "name": "ports",
             "type": "string"
+          },
+          {
+            "internalType": "uint8",
+            "name": "approval",
+            "type": "uint8"
           }
         ],
         "internalType": "struct NanAppCatalog.Version",
@@ -500,6 +613,11 @@
             "internalType": "string",
             "name": "ports",
             "type": "string"
+          },
+          {
+            "internalType": "uint8",
+            "name": "approval",
+            "type": "uint8"
           }
         ],
         "internalType": "struct NanAppCatalog.Version[]",
@@ -610,6 +728,29 @@
       }
     ],
     "name": "setActive",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bytes32",
+        "name": "appId",
+        "type": "bytes32"
+      },
+      {
+        "internalType": "uint256",
+        "name": "index",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint8",
+        "name": "status",
+        "type": "uint8"
+      }
+    ],
+    "name": "setApproval",
     "outputs": [],
     "stateMutability": "nonpayable",
     "type": "function"

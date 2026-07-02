@@ -245,7 +245,7 @@
         ],
         "operationId": "createDeployment",
         "summary": "Create a deployment (awaiting payment)",
-        "description": "Reserves a GPU share and returns a deployment in `awaiting_payment` with a `payment` block. The Wasm app is NOT started yet: sign a USDC payment authorization (EIP-3009 ReceiveWithAuthorization) and submit payWithAuthorization(deploymentRef, ...); the enclave sees the payment, launches your app as its own sandboxed, MPS-capped worker process on the confidential GPU, and starts the clock. amount(6dp) / ratePerSecondUsdc = seconds of runtime. Unpaid reservations are released after a window. The share is a software cap (MPS under NVIDIA CC; CC disables MIG, so splits are arbitrary, not fixed profiles).",
+        "description": "Reserves a GPU share and returns a deployment in `awaiting_payment` with a `payment` block. The Wasm app is NOT started yet: sign a USDC payment authorization (EIP-3009 ReceiveWithAuthorization) and submit payWithAuthorization(deploymentRef, ...); the enclave sees the payment, launches your app as its own sandboxed, MPS-capped worker process on the confidential GPU, and starts the clock. amount(6dp) / ratePerSecondUsdc = seconds of runtime. Unpaid reservations are released after a window. The share is a software cap (MPS under NVIDIA CC; CC disables MIG, so splits are arbitrary, not fixed profiles). Catalog apps (ipfs://<cid> references) deploy only after the catalog owner has approved that version on-chain; unapproved or rejected versions return 403 not_approved.",
         "requestBody": {
           "required": true,
           "content": {
@@ -277,6 +277,16 @@
               }
             }
           },
+          "403": {
+            "description": "App not approved (`not_approved`): the referenced catalog app version has not been approved by the catalog owner (or was rejected, yanked, or delisted). Only the NanAppCatalog deployer can approve a version, by signing a setApproval transaction; until then its ipfs:// CID cannot be deployed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
           "409": {
             "description": "No single card has that share free.",
             "content": {
@@ -289,6 +299,16 @@
           },
           "422": {
             "description": "Invalid spec (e.g. share out of range, or share exceeds a whole card).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Approval could not be verified (`approval_unavailable` / `catalog_unreachable`): the enclave has no catalog configured or the chain RPC is unreachable. The gate fails closed; retry later.",
             "content": {
               "application/json": {
                 "schema": {

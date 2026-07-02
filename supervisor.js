@@ -48,6 +48,12 @@ const CORS_ORIGINS   = (process.env.CORS_ORIGINS || "https://nan.host").split(",
 //     balance, no escrow contract, no key in the enclave that can move funds.
 const FORWARDER_ADDRESS  = process.env.FORWARDER_ADDRESS || "";   // NanPay contract (watch-only)
 const USDC_ADDRESS       = process.env.USDC_ADDRESS || "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"; // USDC on Base
+// --- app approval: NanAppCatalog (read-only) is the deploy gate for catalog apps.
+//     Only the catalog's owner (the EOA that deployed it) can approve/reject a
+//     version, by signing a setApproval transaction; an ipfs://<cid> deploy is
+//     refused until its version is Approved. Empty = catalog apps can't deploy
+//     at all (fail closed); baked-in app ids are exempt (attested image content).
+const APP_CATALOG_ADDRESS = process.env.APP_CATALOG_ADDRESS || "";
 const PAYMENT_WINDOW_SEC = parseInt(process.env.PAYMENT_WINDOW_SEC || "600", 10); // unpaid awaiting_payment TTL
 const GRACE_SEC          = parseInt(process.env.GRACE_SEC || "90", 10);           // post-expiry grace before teardown
 const PAY_POLL_SEC       = parseInt(process.env.PAY_POLL_SEC || "12", 10);        // Base log poll interval
@@ -1156,9 +1162,67 @@ function armPayTimer(rec) {
   if (rec._payTimer.unref) rec._payTimer.unref();
 }
 
+// ---- app approval (vm backend): catalog-gated deploys -----------------------
+// One eth_call resolves a CID to its listing + deployability flags.
+const CATALOG_ABI = [{ type: "function", name: "cidStatus", stateMutability: "view",
+  inputs: [{ name: "cid", type: "string" }],
+  outputs: [
+    { name: "listed",    type: "bool"    },
+    { name: "appId",     type: "bytes32" },
+    { name: "index",     type: "uint256" },
+    { name: "approval",  type: "uint8"   },   // 0 pending | 1 approved | 2 rejected
+    { name: "yanked",    type: "bool"    },
+    { name: "appActive", type: "bool"    },
+  ] }];
+const BARE_CID_RE = /^(baf[a-z0-9]{10,}|Qm[1-9A-HJ-NP-Za-km-z]{20,})$/;
+// Baked-in app ids only — no paths or .wasm filenames. The wasm-manager also
+// resolves bare paths under its APPS_DIR (e.g. a cached ipfs-<cid>.wasm), which
+// would dodge the approval check, so those never get past this API.
+const BAKED_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+
+// Gate a vm-backend app reference on catalog approval. Returns { ref } (the
+// reference to run, bare CIDs normalized to ipfs://) or { error }. An RPC
+// failure REJECTS the deploy (fail closed): this is the enforcement point, so
+// an outage must not waive it.
+async function gateAppReference(reference) {
+  const deny = (status, code, msg) => ({ error: { status, code, msg } });
+  let ref = String(reference || "").trim();
+  if (BARE_CID_RE.test(ref)) ref = "ipfs://" + ref;
+  const m = /^ipfs:\/\/([^/?#]+)/.exec(ref);
+  if (!m) {
+    if (BAKED_ID_RE.test(ref)) return { ref };            // baked-in id: part of the attested image
+    return deny(422, "invalid_spec", "image.reference must be a baked-in app id or an ipfs://<cid> listed in the app catalog.");
+  }
+  if (!APP_CATALOG_ADDRESS)
+    return deny(503, "approval_unavailable", "Catalog apps are disabled on this enclave: APP_CATALOG_ADDRESS is not configured, so approval cannot be verified.");
+  let st;
+  try {
+    st = await chainClient.readContract({ address: getAddress(APP_CATALOG_ADDRESS),
+      abi: CATALOG_ABI, functionName: "cidStatus", args: [m[1]] });
+  } catch (e) {
+    console.warn(`[approval] cidStatus(${m[1]}) failed: ${e.shortMessage || e.message}`);
+    return deny(503, "catalog_unreachable", "Could not verify this app's approval against the on-chain catalog; try again shortly.");
+  }
+  const [listed, , , approval, yanked, appActive] = st;
+  if (!listed)               return deny(403, "not_approved", "This CID is not listed in the app catalog. Publish it, then ask the catalog owner to approve it.");
+  if (!appActive)            return deny(403, "not_approved", "This app is delisted from the catalog.");
+  if (yanked)                return deny(403, "not_approved", "This version was yanked by its publisher.");
+  if (Number(approval) === 2) return deny(403, "not_approved", "This version was rejected by the catalog owner.");
+  if (Number(approval) !== 1) return deny(403, "not_approved", "This version is awaiting catalog-owner approval; it cannot be deployed yet.");
+  return { ref };
+}
+
 app.post("/v1/deployments", authed, async (req, res) => {
   const b = req.body || {};
-  const image = (b.image && b.image.reference) ? b.image : { reference: DEFAULT_IMAGE };
+  let image = (b.image && b.image.reference) ? b.image : { reference: DEFAULT_IMAGE };
+  // Approval gate (vm backend runs catalog apps): only baked-in ids and ipfs://
+  // CIDs whose version the catalog owner APPROVED may deploy. Checked before any
+  // reservation so a refused app never holds capacity or a payment window.
+  if (PROVISION_BACKEND === "vm") {
+    const g = await gateAppReference(image.reference);
+    if (g.error) return fail(res, g.error.status, g.error.code, g.error.msg);
+    image = { ...image, reference: g.ref };
+  }
   const appPort = Number(b.port) || 8080;
   // Public endpoint: anyone can reach the app's data path (hosting a website/API).
   // Private (default): only the owner's SIWE token can. SSH/management stay owner-only

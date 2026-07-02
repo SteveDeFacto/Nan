@@ -651,6 +651,8 @@ footer{border-top:1px solid var(--line-soft);background:var(--bg-1);padding:56px
 .app-badge{flex:none;font-family:var(--font-mono);font-size:.62rem;letter-spacing:.08em;text-transform:uppercase;
   padding:3px 8px;border-radius:999px;border:1px solid var(--jade-dim);color:var(--jade);background:var(--jade-deep);white-space:nowrap;}
 .app-badge.unv{border-color:var(--line);color:var(--text-dim);background:transparent;}
+.app-badge.rej{border-color:var(--danger);color:var(--danger);background:transparent;}
+.btn[disabled]{opacity:.45;cursor:not-allowed;pointer-events:none;}
 .app-desc{margin:0;font-size:.88rem;color:var(--text-muted);line-height:1.5;flex:1 1 auto;}
 .app-metaline{display:flex;flex-wrap:wrap;gap:8px;font-family:var(--font-mono);font-size:.72rem;color:var(--text-dim);}
 .app-cid{display:flex;align-items:center;gap:6px;background:var(--bg-1);border:1px solid var(--line-soft);border-radius:var(--radius-sm);padding:6px 8px;}
@@ -3457,6 +3459,8 @@ function resolveAppRef(input){
   if (apps.length > 1) return { reference: input, label: input, error: "Several publishers have '" + slug + "' — qualify it: <publisher>/" + slug + ":" + version };
   const v = apps[0].versions.find(x => x.version === version && !x.yanked);
   if (!v) return { reference: input, label: input, error: "'" + slug + "' has no live version '" + version + "'." };
+  if (v.approval !== APPROVAL.approved)
+    return { reference: input, label: input, error: "'" + slug + ":" + version + "' " + (v.approval === APPROVAL.rejected ? "was rejected" : "isn’t approved yet") + " by the catalog owner — the enclave refuses to deploy it." };
   REF_CACHE[input] = "ipfs://" + v.cid;
   PORTS_CACHE[input] = v.ports || "";
   return { reference: REF_CACHE[input], label: input };
@@ -4158,14 +4162,17 @@ const MAX_WASM_BYTES      = MAX_WASM_MB * 1024 * 1024;
 const CAT_SEL = {
   appCount:"b55ca2c3", getAppsPage:"a0483de1", getVersionsPage:"2eb7c1f0", owner:"8da5cb5b",
   publishVersion:"2936ec7d", setActive:"9e4b5d56", yankVersion:"345c52dc", setVerified:"4ca171e5",
+  setApproval:"a67613fa",
 };
+// Version.approval: the owner's deploy-gating ruling (unlike `verified`, a curation signal)
+const APPROVAL = { pending:0, approved:1, rejected:2 };
 const CAT_MAX = { slug:40, name:80, desc:500, version:32, cid:100, mem:8192 };
 const APP_SCHEMA = [
   {k:"appId",t:"bytes32"},{k:"publisher",t:"addr"},{k:"slug",t:"str"},{k:"name",t:"str"},
   {k:"description",t:"str"},{k:"versionCount",t:"uint"},{k:"createdAt",t:"uint"},{k:"updatedAt",t:"uint"},{k:"active",t:"bool"},
 ];
 const VER_SCHEMA = [
-  {k:"cid",t:"str"},{k:"version",t:"str"},{k:"memMb",t:"uint"},{k:"createdAt",t:"uint"},{k:"verified",t:"bool"},{k:"yanked",t:"bool"},{k:"ports",t:"str"},
+  {k:"cid",t:"str"},{k:"version",t:"str"},{k:"memMb",t:"uint"},{k:"createdAt",t:"uint"},{k:"verified",t:"bool"},{k:"yanked",t:"bool"},{k:"ports",t:"str"},{k:"approval",t:"uint"},
 ];
 // firewall entry: http (default web app) | http:N | tcp:N | udp:N, N in 1-19999 (labels; <1024 always remapped)
 // (8080/8091 are infra-reserved; the enclave enforces the same rules server-side)
@@ -4303,7 +4310,7 @@ function renderApps(){
 }
 function appCard(app){
   const i = selIdx(app);
-  const v = app.versions[i] || { cid:"", version:"—", memMb:0, verified:false, yanked:false };
+  const v = app.versions[i] || { cid:"", version:"—", memMb:0, verified:false, yanked:false, approval:APPROVAL.pending };
   const me = (Nan.address || "").toLowerCase();
   const isPub = me && app.publisher.toLowerCase() === me;
   const isOwner = me && STORE.owner && me === STORE.owner;
@@ -4311,10 +4318,17 @@ function appCard(app){
   const badge = v.verified
     ? '<span class="app-badge" title="This version is marked verified by the catalog owner">✓ verified</span>'
     : '<span class="app-badge unv" title="Community-published; not owner-verified">community</span>';
+  // approval is the deploy gate: the enclave refuses this CID until the catalog owner approves it
+  const apBadge = v.approval === APPROVAL.approved
+    ? '<span class="app-badge" title="Approved by the catalog owner — deployable">✓ approved</span>'
+    : v.approval === APPROVAL.rejected
+    ? '<span class="app-badge rej" title="Rejected by the catalog owner — deploys are refused">✕ rejected</span>'
+    : '<span class="app-badge unv" title="Awaiting catalog-owner approval — deploys are refused until then">pending</span>';
+  const apLabel = (vv) => vv.approval === APPROVAL.rejected ? ' (rejected)' : vv.approval !== APPROVAL.approved ? ' (pending)' : '';
   const opts = app.versions.map((vv, idx) =>
-    '<option value="' + idx + '"' + (idx === i ? ' selected' : '') + '>' + esc(vv.version) + (vv.verified ? ' ✓' : '') + (vv.yanked ? ' (yanked)' : '') + '</option>').join('');
+    '<option value="' + idx + '"' + (idx === i ? ' selected' : '') + '>' + esc(vv.version) + (vv.verified ? ' ✓' : '') + (vv.yanked ? ' (yanked)' : '') + apLabel(vv) + '</option>').join('');
   return '<article class="app-card' + (v.verified ? ' verified' : '') + '" data-appid="' + app.appId + '">'
-    + '<div class="app-head"><h3>' + esc(app.name) + '</h3>' + badge + '</div>'
+    + '<div class="app-head"><h3>' + esc(app.name) + '</h3>' + badge + apBadge + '</div>'
     + '<p class="app-desc">' + (app.description ? esc(app.description) : '<span class="dim">no description</span>') + '</p>'
     + '<div class="app-metaline"><span title="publisher (msg.sender)">' + short(app.publisher) + '</span><span>·</span><span>' + app.versions.length + (app.versions.length === 1 ? ' version' : ' versions') + '</span></div>'
     + '<div class="app-verrow"><span class="vlbl">version</span><select class="ver-select" aria-label="Version">' + opts + '</select><span>' + v.memMb + ' MB</span>'
@@ -4322,11 +4336,14 @@ function appCard(app){
     + (v.yanked ? '<span class="vyank">yanked</span>' : '') + '</div>'
     + '<div class="app-cid" title="IPFS content id"><code>' + esc(v.cid) + '</code><button class="copybtn" data-act="copy" data-cid="' + esc(v.cid) + '" type="button">⧉</button></div>'
     + '<div class="app-actions">'
-    + '<button class="btn btn-primary btn-sm" data-act="deploy" data-cid="' + esc(v.cid) + '" type="button">Use in Deploy →</button>'
+    + '<button class="btn btn-primary btn-sm" data-act="deploy" data-cid="' + esc(v.cid) + '" type="button"'
+      + (v.approval === APPROVAL.approved ? '' : ' disabled title="Deploys unlock once the catalog owner approves this version"') + '>Use in Deploy →</button>'
     + '<a class="btn btn-sm" href="' + gw + '" target="_blank" rel="noopener">fetch .wasm</a>'
     + (isPub ? '<button class="btn btn-sm" data-act="delist" type="button">delist</button>' : '')
     + (isPub && !v.yanked ? '<button class="btn btn-sm" data-act="yank" data-idx="' + i + '" type="button">yank</button>' : '')
     + (isOwner ? '<button class="btn btn-sm" data-act="verify" data-idx="' + i + '" data-v="' + (v.verified ? 0 : 1) + '" type="button">' + (v.verified ? 'unverify' : 'verify') + '</button>' : '')
+    + (isOwner && v.approval !== APPROVAL.approved ? '<button class="btn btn-sm" data-act="approve" data-idx="' + i + '" type="button">approve</button>' : '')
+    + (isOwner && v.approval !== APPROVAL.rejected ? '<button class="btn btn-sm" data-act="reject" data-idx="' + i + '" type="button">reject</button>' : '')
     + '</div></article>';
 }
 function refreshCard(appId){
@@ -4452,6 +4469,8 @@ async function catTx(data, verb){
 const setActiveTx   = (slug, active) => catTx(encCall(CAT_SEL.setActive,   [{t:"str",v:slug},{t:"bool",v:active}]), active ? "relisting" : "delisting");
 const yankTx        = (slug, idx)    => catTx(encCall(CAT_SEL.yankVersion, [{t:"str",v:slug},{t:"uint",v:idx}]),   "yanking");
 const setVerifiedTx = (appId, idx, v) => catTx(encCall(CAT_SEL.setVerified, [{t:"bytes32",v:appId},{t:"uint",v:idx},{t:"bool",v:v}]), v ? "verifying" : "unverifying");
+// owner-only deploy gate: the wallet signature on this tx IS the approval/rejection
+const setApprovalTx = (appId, idx, st) => catTx(encCall(CAT_SEL.setApproval, [{t:"bytes32",v:appId},{t:"uint",v:idx},{t:"uint",v:st}]), st === APPROVAL.approved ? "approving" : "rejecting");
 
 function resetPublish(){
   ["#pubSlug","#pubCid","#pubName","#pubDesc","#pubPorts"].forEach(s => { const el = $(s); if (el) el.value = ""; });
@@ -4501,6 +4520,8 @@ function initStore(){
     else if (act === "delist"){ if (confirm("Delist this whole app? It stays on-chain but is hidden from the store.")) setActiveTx(app.slug, false); }
     else if (act === "yank"){ const idx = parseInt(btn.dataset.idx, 10); if (confirm("Yank version " + app.versions[idx].version + "? It stays on-chain but readers hide it.")) yankTx(app.slug, idx); }
     else if (act === "verify") setVerifiedTx(app.appId, parseInt(btn.dataset.idx, 10), btn.dataset.v === "1");
+    else if (act === "approve") setApprovalTx(app.appId, parseInt(btn.dataset.idx, 10), APPROVAL.approved);
+    else if (act === "reject"){ const idx = parseInt(btn.dataset.idx, 10); if (confirm("Reject version " + app.versions[idx].version + "? The enclave will refuse to deploy it until you approve it.")) setApprovalTx(app.appId, idx, APPROVAL.rejected); }
   });
 }
 

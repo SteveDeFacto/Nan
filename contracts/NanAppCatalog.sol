@@ -26,8 +26,15 @@ pragma solidity ^0.8.20;
 ///   - `verified` is an OPTIONAL owner-curated signal, set PER VERSION (you verify
 ///     a specific CID, and a new release starts unverified — it must be re-checked).
 ///     It does not gate execution; the CID does. The site can filter to verified.
+///   - `approval` DOES gate deploys, set PER VERSION by the owner (the address
+///     that deployed this catalog). Publishing stays permissionless, but a
+///     version starts Pending and runners refuse to deploy its CID until the
+///     owner signs a setApproval(..., Approved) transaction; Rejected is a
+///     standing "no". A new release starts Pending again — approval is of a
+///     specific CID, never of a lineage.
 ///   - The phased "run-by-CID" deploy path references a chosen version as
-///     `image.reference = ipfs://<cid>`.
+///     `image.reference = ipfs://<cid>`; runners resolve deployability in one
+///     call via `cidStatus(cid)`.
 contract NanAppCatalog {
     struct App {
         bytes32 appId;        // keccak256(publisher, slug); stable identity across versions
@@ -50,7 +57,16 @@ contract NanAppCatalog {
         string  ports;        // firewall config: "" = standard web app (wasi:http serve);
                               // else CSV of "http:N" / "tcp:N" / "udp:N" the app may bind
                               // (per version — a release can change its port needs)
+        uint8   approval;     // deploy gate, owner-ruled: 0 Pending, 1 Approved, 2 Rejected
     }
+    /// @dev CID -> owning version, for `cidStatus`. index1 is the version index + 1
+    ///      so the zero value doubles as "CID not listed" (also enforces the global
+    ///      CID-uniqueness rule that used to live in a separate bool mapping).
+    struct CidRef { bytes32 appId; uint32 index1; }
+
+    uint8 public constant APPROVAL_PENDING  = 0;
+    uint8 public constant APPROVAL_APPROVED = 1;
+    uint8 public constant APPROVAL_REJECTED = 2;
 
     uint256 private constant MAX_SLUG = 40;
     uint256 private constant MAX_NAME = 80;
@@ -61,18 +77,19 @@ contract NanAppCatalog {
     uint256 private constant MAX_PORTS = 96;   // CSV port spec, e.g. "http:8088,tcp:5432,udp:9053"
                                                // (runners restrict the range; 8080/8091 are infra-reserved)
 
-    address public owner;                             // sets `verified`; can hand off
+    address public owner;                             // sets `verified` + `approval`; can hand off
     bytes32[] private _appIds;                        // every app ever created
     mapping(bytes32 => App) private _apps;
     mapping(bytes32 => bool) private _exists;
     mapping(bytes32 => Version[]) private _versions;  // appId -> release history
-    mapping(bytes32 => bool) private _cidUsed;        // keccak256(cid) -> already listed (global uniqueness)
+    mapping(bytes32 => CidRef) private _cidRefs;      // keccak256(cid) -> owning version (index1=0 -> unlisted)
     mapping(bytes32 => bool) private _verUsed;        // keccak256(appId, version) -> label taken (per-app uniqueness)
 
     event AppCreated(bytes32 indexed appId, address indexed publisher, string slug, string name);
     event AppEdited(bytes32 indexed appId, string name, string description);
     event VersionPublished(bytes32 indexed appId, uint256 indexed index, string version, string cid);
     event VersionVerified(bytes32 indexed appId, uint256 indexed index, bool verified);
+    event VersionApprovalSet(bytes32 indexed appId, uint256 indexed index, uint8 status);
     event VersionYanked(bytes32 indexed appId, uint256 indexed index);
     event AppActiveSet(bytes32 indexed appId, bool active);
     event OwnerChanged(address indexed owner);
@@ -102,7 +119,7 @@ contract NanAppCatalog {
         require(memMb > 0 && memMb <= MAX_MEM, "memMb range");
         require(bytes(ports).length <= MAX_PORTS, "ports length");
 
-        _reserveCid(cid);
+        bytes32 cidKey = _reserveCid(cid);
         appId = _touchApp(slug, name, description);
 
         // version labels are unique within an app, so `slug:version` resolves to
@@ -117,9 +134,10 @@ contract NanAppCatalog {
         vs.push(Version({
             cid: cid, version: version, memMb: memMb,
             createdAt: uint64(block.timestamp), verified: false, yanked: false,
-            ports: ports
+            ports: ports, approval: APPROVAL_PENDING
         }));
         index = vs.length - 1;
+        _cidRefs[cidKey] = CidRef({ appId: appId, index1: uint32(index + 1) });
 
         App storage a = _apps[appId];
         a.versionCount = uint32(vs.length);
@@ -128,11 +146,11 @@ contract NanAppCatalog {
         emit VersionPublished(appId, index, version, cid);
     }
 
-    /// @dev Enforce global CID uniqueness (a wasm artifact is listed at most once).
-    function _reserveCid(string calldata cid) private {
-        bytes32 cidKey = keccak256(bytes(cid));
-        require(!_cidUsed[cidKey], "cid already listed");
-        _cidUsed[cidKey] = true;
+    /// @dev Enforce global CID uniqueness (a wasm artifact is listed at most once);
+    ///      the reverse-lookup entry itself is written once the version index is known.
+    function _reserveCid(string calldata cid) private view returns (bytes32 cidKey) {
+        cidKey = keccak256(bytes(cid));
+        require(_cidRefs[cidKey].index1 == 0, "cid already listed");
     }
 
     /// @dev Create the app on first use, then refresh its display metadata. Returns appId.
@@ -198,6 +216,20 @@ contract NanAppCatalog {
         emit VersionVerified(appId, index, v);
     }
 
+    /// @notice Owner ruling on a specific version: Approved unlocks API deploys of
+    ///         its CID, Rejected is a standing "no", Pending re-opens review.
+    /// @dev Unlike `verified` (a curation signal), THIS gates deploys: runners
+    ///      refuse any CID whose version isn't Approved. Approval is per CID —
+    ///      a new release of the same app starts Pending and must be re-approved.
+    function setApproval(bytes32 appId, uint256 index, uint8 status) external {
+        require(msg.sender == owner, "!owner");
+        require(_exists[appId], "unknown app");
+        require(index < _versions[appId].length, "bad index");
+        require(status <= APPROVAL_REJECTED, "bad status");
+        _versions[appId][index].approval = status;
+        emit VersionApprovalSet(appId, index, status);
+    }
+
     function transferOwnership(address o) external {
         require(msg.sender == owner, "!owner");
         require(o != address(0), "zero addr");
@@ -211,6 +243,18 @@ contract NanAppCatalog {
     function getApp(bytes32 appId) external view returns (App memory) { return _apps[appId]; }
     function numVersions(bytes32 appId) external view returns (uint256) { return _versions[appId].length; }
     function getVersion(bytes32 appId, uint256 index) external view returns (Version memory) { return _versions[appId][index]; }
+
+    /// @notice One-call deploy gate for runners: resolve a CID to its listing and
+    ///         the flags that decide deployability (deployable iff `listed`,
+    ///         `appActive`, not `yanked`, and approval == APPROVAL_APPROVED).
+    function cidStatus(string calldata cid) external view returns (
+        bool listed, bytes32 appId, uint256 index, uint8 approval, bool yanked, bool appActive
+    ) {
+        CidRef storage r = _cidRefs[keccak256(bytes(cid))];
+        if (r.index1 == 0) return (false, bytes32(0), 0, 0, false, false);
+        Version storage v = _versions[r.appId][r.index1 - 1];
+        return (true, r.appId, r.index1 - 1, v.approval, v.yanked, _apps[r.appId].active);
+    }
 
     /// @notice Paginated app list (metadata only; fetch each app's versions separately).
     function getAppsPage(uint256 start, uint256 n) external view returns (App[] memory page) {

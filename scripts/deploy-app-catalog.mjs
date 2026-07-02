@@ -40,6 +40,7 @@ const REPO = path.resolve(HERE, "..");
 const CONTRACT = path.join(REPO, "contracts", "NanAppCatalog.sol");
 const ABI_OUT = path.join(REPO, "contracts", "NanAppCatalog.abi.json");
 const SITE = path.join(REPO, "site", "index.html");
+const CONFIG = path.join(REPO, "tinfoil-config.yml");
 
 const args = new Set(process.argv.slice(2));
 const DRY_RUN = args.has("--dry-run");
@@ -99,6 +100,21 @@ function writeSiteConfig(addr, chainId, rpc) {
   for (const [re, rep] of subs) html = html.replace(re, rep);
   fs.writeFileSync(SITE, html);
   console.log(`Wrote ${subs.map((s) => s[2]).join(", ")} into ${path.relative(REPO, SITE)}`);
+}
+
+// Point the supervisor at the same deployment: it reads cidStatus() at deploy
+// time and refuses ipfs:// apps the catalog owner hasn't Approved. Mirrors
+// deploy-nanpay.mjs's FORWARDER_ADDRESS write.
+function writeSupervisorConfig(addr, chainId) {
+  let cfg = fs.readFileSync(CONFIG, "utf8");
+  const re = /(-\s*APP_CATALOG_ADDRESS:\s*)"[^"]*"/;
+  if (!re.test(cfg)) die(`could not find APP_CATALOG_ADDRESS line in ${CONFIG}`);
+  cfg = cfg.replace(re, `$1"${addr}"`);
+  fs.writeFileSync(CONFIG, cfg);
+  console.log(`Wrote APP_CATALOG_ADDRESS="${addr}" into ${path.relative(REPO, CONFIG)}`);
+  const chainRe = /-\s*CHAIN_ID:\s*"(\d+)"/.exec(cfg);
+  if (chainRe && Number(chainRe[1]) !== chainId)
+    console.warn(`WARNING: tinfoil-config.yml has CHAIN_ID ${chainRe[1]} but the catalog was deployed to chain ${chainId} — the supervisor reads the catalog over BASE_RPC, so approval checks will fail until they match.`);
 }
 
 async function chooseNetwork() {
@@ -171,13 +187,15 @@ async function main() {
   console.log(`  set in site        const APP_CATALOG_CHAIN   = ${net.chain.id}`);
   console.log("===============================================================\n");
 
-  if (!NO_WRITE_CONFIG) writeSiteConfig(addr, net.chain.id, rpc);
-  else console.log("(--no-write-config: skipped wiring site/index.html; set APP_CATALOG_ADDRESS manually)");
+  if (!NO_WRITE_CONFIG) { writeSiteConfig(addr, net.chain.id, rpc); writeSupervisorConfig(addr, net.chain.id); }
+  else console.log("(--no-write-config: skipped wiring site/index.html + tinfoil-config.yml; set APP_CATALOG_ADDRESS manually)");
 
   console.log("\nNext:");
-  console.log(`  1. site/index.html now points at ${addr} on chain ${net.chain.id}.`);
+  console.log(`  1. site/index.html + tinfoil-config.yml now point at ${addr} on chain ${net.chain.id}.`);
   console.log("  2. Redeploy the site:  cd site && ./deploy.sh");
-  if (!isMainnet) console.log("  3. Test publish/browse on testnet, THEN re-run with NETWORK=base for mainnet.");
+  console.log("  3. Rebuild+repin the supervisor so the enclave enforces approval:  ./scripts/release.sh nan");
+  console.log("  4. Approve versions from the Apps tab with the deployer wallet (it is the catalog owner).");
+  if (!isMainnet) console.log("  5. Test publish/approve/deploy on testnet, THEN re-run with NETWORK=base for mainnet.");
 }
 
 main().catch((e) => die(e.message || String(e)));

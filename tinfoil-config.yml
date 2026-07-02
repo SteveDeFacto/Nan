@@ -79,6 +79,11 @@ containers:
       # NOTE: requires outbound egress from the enclave to BASE_RPC. Confirm with Tinfoil.
       - FORWARDER_ADDRESS: "0xDd3905faE5F961891e6392eA48Cb63d5a4732b87"                            # set after deploying NanPay.sol
       - USDC_ADDRESS: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC on Base
+      # app approval gate: NanAppCatalog (read-only, written by scripts/deploy-app-catalog.mjs).
+      # ipfs:// app deploys are REFUSED unless the catalog owner has Approved that
+      # version (setApproval tx signed by the catalog's deployer key). Empty =
+      # catalog apps can't deploy at all; baked-in ids still can (attested image).
+      - APP_CATALOG_ADDRESS: ""                          # set after deploying NanAppCatalog.sol (must be on CHAIN_ID's chain, read via BASE_RPC)
       - PAYMENT_WINDOW_SEC: "600"                        # unpaid deployments release the reservation
       - GRACE_SEC: "90"                                  # grace after expiry before teardown (top-up window)
       - PAY_POLL_SEC: "12"

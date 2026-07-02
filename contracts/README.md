@@ -135,8 +135,9 @@ browser --(publishVersion tx)---------> NanAppCatalog   one Base tx; publisher =
   hash of the exact wasm), never the bytes, so a caller fetches from any IPFS peer
   and verifies the bytes match the CID independently.
 
-**Run-by-CID (implemented).** Uploaded apps deploy, not just browse. `image.reference`
-accepts:
+**Run-by-CID (implemented).** Uploaded apps deploy, not just browse — once the
+catalog owner **approves** the version (see the trust model below; unapproved CIDs
+get `403 not_approved` from the API). `image.reference` accepts:
 - a baked-in catalog id (`hello`),
 - `ipfs://<cid>`, or
 - a human-friendly `slug:version` (or `<publisher>/slug:version` to disambiguate) —
@@ -180,12 +181,25 @@ Manager env: `IPFS_GATEWAY` (default `https://ipfs.nan.host`), `WASM_MAX_BYTES`
 - `verified` is an OPTIONAL owner-curated signal, set **per version** (you verify a
   specific CID; a new release starts unverified and must be re-checked). It does
   **not** gate execution — the CID does. The site can filter to verified.
+- **`approval` DOES gate API deploys.** Publishing stays permissionless, but every
+  version starts **Pending** and the supervisor refuses to deploy its CID
+  (`403 not_approved`) until the catalog **owner** — the EOA that deployed the
+  contract — signs a `setApproval(appId, index, Approved)` transaction (Rejected is
+  a standing "no"; only the owner can rule, enforced by the contract). Approval is
+  per CID: a new release of the same app starts Pending again. The supervisor
+  resolves deployability in one `cidStatus(cid)` eth_call (listed + app active +
+  not yanked + Approved) against `APP_CATALOG_ADDRESS` from `tinfoil-config.yml`,
+  and **fails closed**: no catalog configured or RPC unreachable ⇒ no catalog-app
+  deploys. Baked-in catalog ids (e.g. `hello`) are exempt — they ship inside the
+  attested wasm-manager image. The site's Apps tab shows the per-version status
+  badge and gives the owner wallet approve/reject buttons.
 
 ## Deploy the contract to Base (chain 8453)
 
-No constructor args; the deployer EOA becomes `owner` (can flip `verified`, can
-`transferOwnership`). A viem+solc script mirrors `deploy-nanpay.mjs` and **wires the
-site automatically** on success:
+No constructor args; the deployer EOA becomes `owner` (approves/rejects versions,
+can flip `verified`, can `transferOwnership`). A viem+solc script mirrors
+`deploy-nanpay.mjs` and **wires the site and `tinfoil-config.yml` automatically**
+on success:
 
 ```bash
 # Base Sepolia dry run (compile + plan, no broadcast):
@@ -199,9 +213,11 @@ NETWORK=base DEPLOYER_PRIVATE_KEY=0x... node scripts/deploy-app-catalog.mjs
 ```
 
 On a successful deploy it rewrites `APP_CATALOG_ADDRESS`, `APP_CATALOG_CHAIN`, and
-`APP_CATALOG_RPC` in `site/index.html` to match the network you deployed to (pass
-`--no-write-config` to skip). It also re-emits `contracts/NanAppCatalog.abi.json`
-from source on every run so the checked-in ABI can't drift from what's deployed.
+`APP_CATALOG_RPC` in `site/index.html`, plus `APP_CATALOG_ADDRESS` in
+`tinfoil-config.yml` so the supervisor enforces the approval gate against the same
+deployment (pass `--no-write-config` to skip both). It also re-emits
+`contracts/NanAppCatalog.abi.json` from source on every run so the checked-in ABI
+can't drift from what's deployed.
 
 > **Deploy once.** Re-running deploys a *fresh, empty* contract at a new address
 > (and, by default, repoints the site at it). Contracts are immutable — schema/logic
