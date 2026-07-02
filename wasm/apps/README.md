@@ -28,6 +28,16 @@ with `wasmtime run` and grants **wasi:sockets** (`-Stcp -Sudp -Sinherit-network
 -Sallow-ip-name-lookup`), and the app is a long-running *command* component that
 binds its ports itself (Rust `std::net` on `wasm32-wasip2` maps to wasi:sockets).
 
+**WASIp3 (component-model async).** Both modes are also launched with `-S p3`
+(wasmtime 45+), so apps may target the WASIp3 API surface — native async
+sockets/streams instead of wasip2's poll-based ones — as an alternative to
+wasip2. Every other rule is unchanged: same `NAN_PORTS` contract, same bind
+audit, same no-fs/no-env sandbox, and the p3 flag does not widen network
+access (that stays gated by the socket grants above). Note guest toolchains
+are still young — e.g. Rust lists a `wasm32-wasip3` target but most distros
+don't ship its std yet. Operators can set `WASM_P3=0` on the wasm-manager to
+drop the flag fleet-wide.
+
 Declared ports are **logical** — the app's stable, advertised interface, like a
 container's EXPOSE. Each deployment gets its own **actual** loopback bind, so two
 tenants can run "the tcp:5432 app" at the same time with zero conflicts; the URL

@@ -80,6 +80,14 @@ PORT_MAX_DECL  = 19999
 PRIV_PORT_MAX  = 1023
 RESERVED_PORTS = {8080, 8091}
 AUDIT_SECS     = float(os.environ.get("WASM_AUDIT_INTERVAL", "10"))
+# WASIp3 (component-model async): wasmtime 45 accepts `-S p3` on both `run`
+# and `serve`, and no longer marks it experimental. The flag widens the API
+# SURFACE only — wasip2 components ignore it, wasip3 components need it to
+# instantiate — while network reach stays gated by the same tcp/udp/
+# inherit-network grants and the bind audit polices what is actually bound.
+# WASM_P3=0 drops the flag fleet-wide (operator kill-switch, e.g. if a
+# wasmtime upgrade regresses p3) without rebuilding the image.
+P3_FLAGS       = [] if os.environ.get("WASM_P3", "1").lower() in ("0", "false", "no") else ["-Sp3"]
 
 _lock = threading.Lock()
 _apps = {}    # id -> record
@@ -280,15 +288,17 @@ def _build_cmd(pspec, wasm, serve_port: int, mem_bytes: int, port_map=None):
                 NAN_PORTS tells it which ("tcp:5432=31245" = logical=actual —
                 bind the actual). The grant is coarse (wasmtime can't allowlist
                 per port), so the audit sweep enforces the firewall: bind an
-                unassigned low port and the app is killed."""
+                unassigned low port and the app is killed.
+    Both modes add -Sp3 (unless WASM_P3=0) so apps may target the WASIp3
+    async APIs as well as wasip2; socket permissions are identical either way."""
     if pspec["serve"]:
-        return ([WASMTIME, "serve", "-Scli", "-Shttp",
+        return ([WASMTIME, "serve", "-Scli", "-Shttp", *P3_FLAGS,
                  "-W", f"max-memory-size={mem_bytes}",
                  "--addr", f"{HOST_IP}:{serve_port}", str(wasm)],
                 serve_port, [serve_port])
     port_map = port_map or {}
     nan_ports = ",".join(f"{e}={port_map[e]}" for e in pspec["norm"])
-    cmd = [WASMTIME, "run", "-Scli", "-Stcp", "-Sudp",
+    cmd = [WASMTIME, "run", "-Scli", *P3_FLAGS, "-Stcp", "-Sudp",
            "-Sinherit-network", "-Sallow-ip-name-lookup",
            "-W", f"max-memory-size={mem_bytes}",
            "--env", "NAN_PORTS=" + nan_ports, str(wasm)]
@@ -588,7 +598,8 @@ def _wasmtime_version() -> str:
 
 def _debug_env() -> dict:
     out = {"runtime": "wasmtime", "mock": MOCK, "apps_dir": str(APPS_DIR),
-           "catalog": sorted(_load_catalog().keys()), "version": _wasmtime_version()}
+           "catalog": sorted(_load_catalog().keys()), "version": _wasmtime_version(),
+           "p3": bool(P3_FLAGS)}
     try:
         out["uname"] = " ".join(os.uname())
     except Exception as e:
