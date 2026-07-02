@@ -21,9 +21,9 @@ import net from "node:net";
 import { execFileSync, execFile } from "node:child_process";
 import { promisify } from "node:util";
 const pexec = promisify(execFile);
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, mkdirSync, writeFileSync, renameSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { WebSocketServer } from "ws";
 import { verifyMessage, createPublicClient, createWalletClient, http as viemHttp, getAddress, keccak256, toHex, stringToBytes } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
@@ -48,6 +48,14 @@ const USDC_ADDRESS       = process.env.USDC_ADDRESS || "0x833589fCD6eDb6E08f4c7C
 const PAYMENT_WINDOW_SEC = parseInt(process.env.PAYMENT_WINDOW_SEC || "600", 10); // unpaid awaiting_payment TTL
 const GRACE_SEC          = parseInt(process.env.GRACE_SEC || "90", 10);           // post-expiry grace before teardown
 const PAY_POLL_SEC       = parseInt(process.env.PAY_POLL_SEC || "12", 10);        // Base log poll interval
+// --- fair billing: funded runtime is a BALANCE, not a wall-clock deadline -----
+// remainingMs drains only on ticks where the platform is actually serving:
+// supervisor up, backend manager healthy, payment watcher fresh, app instance
+// alive. Any outage FREEZES every clock; it resumes on the first healthy tick.
+// State is persisted so a supervisor restart freezes (never forfeits) the clock.
+const BILL_TICK_SEC      = parseInt(process.env.BILL_TICK_SEC || "15", 10);       // billing/reaper cadence
+const WATCHER_STALE_SEC  = Math.max(60, 5 * PAY_POLL_SEC);                        // watcher silence that freezes billing
+const STATE_FILE         = process.env.STATE_FILE || "/var/lib/nan/state.json";   // mount a volume here to survive restarts
 // manual-billing / pilot: boot deployments WITHOUT waiting for an on-chain payment.
 //   AUTO_PROVISION=1            -> every deploy provisions immediately (closed pilot).
 //   ADMIN_TOKEN set            -> operator can provision one deployment on demand via
@@ -361,6 +369,83 @@ const deployments = new Map(); // id -> record (incl. local container handle)
 setInterval(() => { const t = Date.now(); for (const [n,v] of nonces) if (v.exp < t) nonces.delete(n); }, 60_000).unref?.();
 const rid = (p) => p + Math.random().toString(36).slice(2, 10);
 
+// ---- state persistence (fair billing across restarts) -----------------------
+// Everything billing-critical (deployments, payment cursor, dedup set) is written
+// to STATE_FILE so a supervisor restart FREEZES clocks instead of forfeiting them:
+// on boot the downtime gap is measured via savedAt and never charged, unpaid
+// reservation windows shift by the gap, and the payment watcher resumes scanning
+// from the block it last finished - payments made during the outage are credited.
+// Without a writable STATE_FILE this degrades to freezing within one process only.
+let _stateDirty = false, _statePersistable = true;
+function serializeState() {
+  const recs = [...deployments.values()].map(r => {
+    const o = { ...r };
+    for (const k of ["_payTimer", "_respawning"]) delete o[k];   // live handles only
+    return o;
+  });
+  return JSON.stringify({
+    savedAt: Date.now(),
+    payFromBlock: _payFromBlock == null ? null : _payFromBlock.toString(),
+    seenLogs: [..._seenLogs].map(([k, b]) => [k, b.toString()]),
+    deployments: recs,
+  });
+}
+function saveStateNow() {
+  if (!_statePersistable) return;
+  try {
+    const tmp = STATE_FILE + ".tmp";
+    writeFileSync(tmp, serializeState());
+    renameSync(tmp, STATE_FILE);                 // atomic: a crash never leaves a torn file
+    _stateDirty = false;
+  } catch (e) { console.warn(`[state] save failed: ${e.message}`); }
+}
+function saveStateSoon() { _stateDirty = true; }
+function initStatePersistence() {
+  try { mkdirSync(dirname(STATE_FILE), { recursive: true }); }
+  catch (e) {
+    _statePersistable = false;
+    console.warn(`[state] ${STATE_FILE} unavailable (${e.message}) - clocks freeze only within this process`);
+    return;
+  }
+  const t = setInterval(() => { if (_stateDirty) saveStateNow(); }, 2000);
+  if (t.unref) t.unref();
+  // flush on shutdown so savedAt marks the true start of the outage
+  for (const sig of ["SIGTERM", "SIGINT"]) process.on(sig, () => { saveStateNow(); process.exit(0); });
+}
+function loadState() {
+  if (!_statePersistable || !existsSync(STATE_FILE)) return;
+  let s; try { s = JSON.parse(readFileSync(STATE_FILE, "utf8")); }
+  catch (e) { console.warn(`[state] unreadable (${e.message}) - starting fresh`); return; }
+  const gapMs = Math.max(0, Date.now() - (s.savedAt || Date.now()));
+  if (s.payFromBlock != null) _payFromBlock = BigInt(s.payFromBlock);   // watcher resumes where it stopped
+  for (const [k, b] of s.seenLogs || []) _seenLogs.set(k, BigInt(b));
+  let running = 0, waiting = 0;
+  for (const r of s.deployments || []) {
+    r._payTimer = null; r._respawning = false;
+    deployments.set(r.id, r);
+    if (r.payRef) payRefIndex.set(r.payRef.toLowerCase(), r.id);
+    if (r._gpu) {                       // re-reserve the GPU slice this deployment still holds
+      const card = gpuCards[r._gpu.cardId];
+      if (card) { card.vramFree -= r._gpu._needV; card.computeFree -= r._gpu.computeShare; }
+    }
+    if (r.status === "running") {
+      // FREEZE the outage: the gap between savedAt and now is never charged. The
+      // first healthy tick verifies the instance (respawning it if the backend
+      // lost it) and resumes the clock.
+      r._lastTickAt = Date.now();
+      r.paused = true; r.pauseReason = "restart_recovery";
+      r._respawnAt = 0; r._respawnBackoffMs = 0;
+      running++;
+    } else if (r.status === "awaiting_payment") {
+      r.payDeadline = (r.payDeadline || Date.now()) + gapMs;   // reservation window frozen too
+      armPayTimer(r);
+      waiting++;
+    }
+  }
+  if (deployments.size) console.log(`[state] restored ${deployments.size} deployment(s) `
+    + `(${running} running, ${waiting} awaiting payment) after ${Math.round(gapMs / 1000)}s down; clocks were frozen`);
+}
+
 // ---- SSH access ------------------------------------------------------------
 // Generate an ed25519 keypair in-enclave via ssh-keygen (correct OpenSSH format).
 // privateKey is surfaced to the user exactly ONCE, in the create response.
@@ -642,7 +727,10 @@ async function authed(req, res, next) {
 // ============================================================================
 // system
 // ============================================================================
-app.get("/v1/health", (_req, res) => res.json({ status: "ok", deployments: deployments.size }));
+app.get("/v1/health", (_req, res) => res.json({ status: "ok", deployments: deployments.size,
+  // watcher freshness is billing-critical: while it's stale, funded clocks are frozen
+  watcher: FORWARDER_ADDRESS ? { lastPollOkAt: _lastPollOkAt ? new Date(_lastPollOkAt).toISOString() : null,
+                                 fresh: (Date.now() - _lastPollOkAt) < WATCHER_STALE_SEC * 1000 } : null }));
 app.get("/v1/version", (_req, res) => res.json({ service: "nan-supervisor/0.1.0", contract: "nan-openapi/1.0.0", chainId: CHAIN_ID }));
 
 app.get("/v1/pricing", (_req, res) => res.json({
@@ -818,7 +906,7 @@ app.get("/v1/account", authed, (req, res) => {
       running: mine.filter(d => d.status === "running").length,
       awaitingPayment: mine.filter(d => d.status === "awaiting_payment").length,
       total: mine.length,
-      totalTimeRemainingSec: mine.reduce((s, d) => s + timeRemainingSec(d), 0),
+      totalTimeRemainingSec: mine.reduce((s, d) => s + (timeRemainingSec(d) || 0), 0),
     },
   });
 });
@@ -826,23 +914,47 @@ app.get("/v1/account", authed, (req, res) => {
 // ============================================================================
 // deployments
 // ============================================================================
-const timeRemainingSec = (rec) => rec.expiresAt ? Math.max(0, Math.round((rec.expiresAt - Date.now()) / 1000)) : 0;
-const spentOf = (rec) => {
-  if (!rec.startedAt) return "0.00";
-  return (((Date.now() - rec.startedAt) / 1000) * (rec.rate || 0)).toFixed(2);
-};
+// remainingMs === null means unlimited (auto-provision pilot); otherwise it only
+// drains on healthy billing ticks, so it IS the truth even mid-outage.
+const timeRemainingSec = (rec) => rec.remainingMs == null ? null : Math.max(0, Math.round(rec.remainingMs / 1000));
+const spentOf = (rec) => (((rec.consumedMs || 0) / 1000) * (rec.rate || 0)).toFixed(2);
 const view = (rec) => {
   const o = { ...rec };
-  for (const k of ["_port", "_gpu", "_gpuSpec", "rate", "_sshPort", "_sshKeySource", "_authorizedKey", "_payTimer"]) delete o[k];
+  for (const k of ["_port", "_gpu", "_gpuSpec", "rate", "_sshPort", "_sshKeySource", "_authorizedKey", "_payTimer",
+                   "remainingMs", "consumedMs", "_lastTickAt", "_respawnAt", "_respawnBackoffMs", "_respawning"]) delete o[k];
   o.ssh = sshAccessOf(rec);
   o.ratePerSecondUsdc = (rec.rate || 0).toFixed(7);
   o.spentUsdc = spentOf(rec);
   o.paidUsdc = ((rec.paidUsdc || 0) / 1e6).toFixed(2);
   o.timeRemainingSec = timeRemainingSec(rec);
-  o.expiresAt = rec.expiresAt ? new Date(rec.expiresAt).toISOString() : null;
+  // an ESTIMATE only: the balance drains solely while service is healthy, so a
+  // frozen (paused) deployment has no meaningful wall-clock expiry.
+  o.expiresAt = (rec.remainingMs != null && rec.status === "running" && !rec.paused)
+    ? new Date(Date.now() + Math.max(0, rec.remainingMs)).toISOString() : null;
   o.payment = paymentInstructions(rec);
   return o;
 };
+
+// Arm (or re-arm after a restart) the unpaid-reservation timer from payDeadline.
+// If the payment watcher is blind when the deadline hits, the reservation is
+// frozen too: a payment may already sit in the unscanned window, so expiry
+// defers until the watcher has caught back up to the chain tip.
+function armPayTimer(rec) {
+  if (rec._payTimer) clearTimeout(rec._payTimer);
+  rec._payTimer = setTimeout(() => {
+    if (rec.status !== "awaiting_payment") return;
+    if (FORWARDER_ADDRESS && (Date.now() - _lastPollOkAt) > WATCHER_STALE_SEC * 1000) {
+      rec.payDeadline = Date.now() + 60_000;
+      armPayTimer(rec); saveStateSoon();
+      return;
+    }
+    if (rec._gpu) { releaseGpu(rec._gpu); rec._gpu = null; }
+    rec.status = "expired"; rec.error = "unpaid";
+    console.log(`[pay] ${rec.id} reservation released (unpaid after payment window)`);
+    saveStateSoon();
+  }, Math.max(0, rec.payDeadline - Date.now()));
+  if (rec._payTimer.unref) rec._payTimer.unref();
+}
 
 app.post("/v1/deployments", authed, async (req, res) => {
   const b = req.body || {};
@@ -903,30 +1015,26 @@ app.post("/v1/deployments", authed, async (req, res) => {
     resources: { vramGb: slice.vramGb, computeShare: round3(slice.computeShare), share: round3(slice.computeShare), cardId: gpu.cardId },
     network: { port: appPort, protocol: "https", endpoint: `${originOf(req)}/x/${id}` },
     attestation: { available: true, vmTechnology: "intel-tdx", gpuTechnology: "nvidia-cc", href: `/v1/deployments/${id}/attestation` },
-    region: "tinfoil", createdAt: new Date().toISOString(), startedAt: null, expiresAt: null,
+    region: "tinfoil", createdAt: new Date().toISOString(), startedAt: null,
+    // fair-billing clock: a funded BALANCE (null = unlimited pilot) drained only
+    // on healthy ticks - see startBillingTicker. paused surfaces a frozen clock.
+    remainingMs: null, consumedMs: 0, paused: false, pauseReason: null, _lastTickAt: 0,
+    payDeadline: Date.now() + PAYMENT_WINDOW_SEC * 1000,
     digest: image.digest || null, rate, payRef, paidUsdc: 0,
     _gpu: gpu, _gpuSpec: { cardId: gpu.cardId, cardUuid: gpuCards[gpu.cardId]?.uuid || null, vramCapGb: gpu.vramGb, computeShare: gpu.computeShare },
     _port: 0, _sshPort: 0, _sshKeySource: keySource, _authorizedKey: authorizedKey, _payTimer: null,
   };
   deployments.set(id, rec);
   payRefIndex.set(payRef.toLowerCase(), id);
-
-  // release the reservation if it goes unpaid within the window
-  rec._payTimer = setTimeout(() => {
-    if (rec.status === "awaiting_payment") {
-      if (rec._gpu) { releaseGpu(rec._gpu); rec._gpu = null; }
-      rec.status = "expired"; rec.error = "unpaid";
-      console.log(`[pay] ${id} reservation released (unpaid after ${PAYMENT_WINDOW_SEC}s)`);
-    }
-  }, PAYMENT_WINDOW_SEC * 1000);
-  if (rec._payTimer.unref) rec._payTimer.unref();
+  armPayTimer(rec);            // release the reservation if unpaid by payDeadline
+  saveStateSoon();
 
   // AUTO_PROVISION: boot now without an on-chain payment (manual billing / pilot).
   if (AUTO_PROVISION) {
     if (!(await forceProvision(rec)))
       return fail(res, 502, "provision_failed", rec.error || "provisioning failed");
     console.log(`[auto-provision] ${id} booted without payment; `
-              + `expiresAt=${rec.expiresAt ? new Date(rec.expiresAt).toISOString() : "never"}`);
+              + `remaining=${rec.remainingMs != null ? Math.round(rec.remainingMs / 1000) + "s" : "unlimited"}`);
   }
 
   const out = view(rec);                                  // includes payment instructions + ssh
@@ -942,7 +1050,8 @@ async function provisionTenant(rec) {
     rec._port = sp.internalPort; rec._sshPort = sp.sshPort;
     if (sp.vmId) { rec._vmId = sp.vmId; rec._vmHostPort = sp.hostPort; }
     if (sp.portMap) rec.portMap = sp.portMap;   // logical -> actual (public: clients see their mapping)
-    rec.startedAt = Date.now(); rec.status = "running";
+    if (!rec.startedAt) rec.startedAt = Date.now();
+    rec.status = "running"; rec.paused = false; rec.pauseReason = null; rec._lastTickAt = Date.now();
     return true;
   } catch (e) {
     rec.status = "failed"; rec.error = e.message;
@@ -957,7 +1066,8 @@ async function provisionTenant(rec) {
 async function forceProvision(rec) {
   if (rec._payTimer) { clearTimeout(rec._payTimer); rec._payTimer = null; }
   const ok = await provisionTenant(rec);
-  if (ok) rec.expiresAt = AUTO_PROVISION_HOURS > 0 ? Date.now() + AUTO_PROVISION_HOURS * 3600 * 1000 : null;
+  if (ok) rec.remainingMs = AUTO_PROVISION_HOURS > 0 ? AUTO_PROVISION_HOURS * 3600 * 1000 : null; // null = unlimited
+  saveStateSoon();
   return ok;
 }
 
@@ -970,15 +1080,18 @@ async function onPaid(payRefHex, payer, amountRaw) {
   rec.paidUsdc = (rec.paidUsdc || 0) + Number(amountRaw);
   if (rec.status === "awaiting_payment") {
     if (rec._payTimer) { clearTimeout(rec._payTimer); rec._payTimer = null; }
-    if (!(await provisionTenant(rec))) return;           // failed provisioning surfaces in the record
-    rec.expiresAt = Date.now() + seconds * 1000;
+    if (!(await provisionTenant(rec))) { saveStateSoon(); return; }  // failed provisioning surfaces in the record
+    rec.remainingMs = seconds * 1000;
     console.log(`[pay] ${id} funded ${(Number(amountRaw)/1e6).toFixed(2)} USDC -> +${Math.round(seconds)}s, provisioned`);
   } else if (rec.status === "running") {
-    rec.expiresAt = Math.max(Date.now(), rec.expiresAt || Date.now()) + seconds * 1000;
-    console.log(`[pay] ${id} top-up ${(Number(amountRaw)/1e6).toFixed(2)} USDC -> +${Math.round(seconds)}s (expires ${new Date(rec.expiresAt).toISOString()})`);
+    // top-up adds to the balance; a grace overrun (negative balance) is forgiven.
+    // remainingMs === null (unlimited pilot) stays unlimited.
+    if (rec.remainingMs != null) rec.remainingMs = Math.max(0, rec.remainingMs) + seconds * 1000;
+    console.log(`[pay] ${id} top-up ${(Number(amountRaw)/1e6).toFixed(2)} USDC -> +${Math.round(seconds)}s (${timeRemainingSec(rec) ?? "unlimited"}s left)`);
   } else {
     console.warn(`[pay] ${id} payment ${(Number(amountRaw)/1e6).toFixed(2)} USDC but status=${rec.status}; ignored (no refunds in pay-per-deploy)`);
   }
+  saveStateSoon();
 }
 
 // Watch the forwarder for Paid events (poll getLogs; robust on public RPC).
@@ -994,10 +1107,15 @@ async function onPaid(payRefHex, payer, amountRaw) {
 //      also makes a mid-poll RPC failure safe to retry.
 const PAY_CONFIRMATIONS = parseInt(process.env.PAY_CONFIRMATIONS || "3", 10);    // blocks of lag before trusting a log
 const PAY_RESCAN_BLOCKS = parseInt(process.env.PAY_RESCAN_BLOCKS || "20", 10);   // trailing overlap re-scanned each poll (~40s on Base)
+const PAY_CHUNK_BLOCKS  = BigInt(process.env.PAY_CHUNK_BLOCKS || "4000");        // max getLogs range per call (public-RPC safe)
+const PAY_MAX_CATCHUP   = BigInt(process.env.PAY_MAX_CATCHUP_BLOCKS || "200000"); // ~4.6 days of Base blocks
 const _seenLogs = new Map();   // "txHash:logIndex" -> blockNumber (pruned as the window advances)
-let _payFromBlock = null;
+let _payFromBlock = null;      // persisted: after downtime the watcher resumes HERE, not at the tip
+let _lastPollOkAt = 0;         // freshness signal: billing + reservation expiry freeze while the watcher is blind
+let _polling = false;
 async function pollPayments() {
-  if (!FORWARDER_ADDRESS) return;
+  if (!FORWARDER_ADDRESS || _polling) return;   // no overlap: catch-up after downtime can outlast one poll interval
+  _polling = true;
   try {
     // retry ETH payments that missed an oracle read (never lose a payment)
     if (_pendingEth.length) {
@@ -1007,24 +1125,38 @@ async function pollPayments() {
     const tip = await chainClient.getBlockNumber();
     const safe = tip - BigInt(PAY_CONFIRMATIONS);                    // don't finalize logs newer than this
     if (safe < 0n) return;
-    if (_payFromBlock == null) _payFromBlock = safe + 1n;            // first run: start at the (confirmed) tip
-    if (safe < _payFromBlock) return;                               // no new confirmed blocks yet
-    const from = _payFromBlock > BigInt(PAY_RESCAN_BLOCKS) ? _payFromBlock - BigInt(PAY_RESCAN_BLOCKS) : 0n;
-    for (const [k, b] of _seenLogs) if (b < from) _seenLogs.delete(k);   // prune dedup set below the window
-    for (const [evt, isEth] of [[PAY_EVENT, false], [PAY_ETH_EVENT, true]]) {
-      const logs = await chainClient.getLogs({ address: getAddress(FORWARDER_ADDRESS),
-        event: evt, fromBlock: from, toBlock: safe });
-      for (const lg of logs) {
-        const key = `${lg.transactionHash}:${lg.logIndex}`;
-        if (_seenLogs.has(key)) continue;                            // exactly-once, even across re-scans / partial failures
-        _seenLogs.set(key, lg.blockNumber);
-        const a = lg.args || {};
-        if (isEth) await onPaidEth(a.deploymentId, a.payer, a.amountWei);
-        else       await onPaid(a.deploymentId, a.payer, a.amount);
-      }
+    if (_payFromBlock == null) _payFromBlock = safe + 1n;            // first EVER run: start at the (confirmed) tip
+    if (safe < _payFromBlock) { _lastPollOkAt = Date.now(); return; } // no new confirmed blocks yet
+    if (safe - _payFromBlock > PAY_MAX_CATCHUP) {                    // bound a very long outage
+      console.warn(`[pay] catch-up clamped: ${safe - _payFromBlock} blocks behind, scanning last ${PAY_MAX_CATCHUP}`);
+      _payFromBlock = safe - PAY_MAX_CATCHUP;
     }
-    _payFromBlock = safe + 1n;
+    // Walk the window in chunks: after an outage it can span hours of blocks, and
+    // public RPCs reject or silently truncate huge ranges. _lastPollOkAt stays
+    // stale until fully caught up, so clocks stay frozen while payments made
+    // during the outage are still being credited.
+    while (_payFromBlock <= safe) {
+      const from = _payFromBlock > BigInt(PAY_RESCAN_BLOCKS) ? _payFromBlock - BigInt(PAY_RESCAN_BLOCKS) : 0n;
+      const to = (safe - from) > PAY_CHUNK_BLOCKS ? from + PAY_CHUNK_BLOCKS : safe;
+      for (const [k, b] of _seenLogs) if (b < from) _seenLogs.delete(k);   // prune dedup set below the window
+      for (const [evt, isEth] of [[PAY_EVENT, false], [PAY_ETH_EVENT, true]]) {
+        const logs = await chainClient.getLogs({ address: getAddress(FORWARDER_ADDRESS),
+          event: evt, fromBlock: from, toBlock: to });
+        for (const lg of logs) {
+          const key = `${lg.transactionHash}:${lg.logIndex}`;
+          if (_seenLogs.has(key)) continue;                          // exactly-once, even across re-scans / partial failures
+          _seenLogs.set(key, lg.blockNumber);
+          const a = lg.args || {};
+          if (isEth) await onPaidEth(a.deploymentId, a.payer, a.amountWei);
+          else       await onPaid(a.deploymentId, a.payer, a.amount);
+        }
+      }
+      _payFromBlock = to + 1n;
+      saveStateSoon();                                               // persist the cursor: a restart resumes, not skips
+    }
+    _lastPollOkAt = Date.now();
   } catch (e) { console.warn(`[pay] poll error: ${e.shortMessage || e.message}`); }
+  finally { _polling = false; }
 }
 function startPaymentWatcher() {
   if (!FORWARDER_ADDRESS) { console.warn("[pay] FORWARDER_ADDRESS unset - payments disabled (deployments will sit awaiting_payment)"); return; }
@@ -1036,19 +1168,96 @@ function startPaymentWatcher() {
   const p = setInterval(() => ethUsdPrice8().catch(() => {}), 300_000); if (p.unref) p.unref();
 }
 
-// Tear down deployments past their funded expiry (+ grace), reclaiming the slice.
-function startReaper() {
+// ---- fair-billing ticker (replaces the wall-clock reaper) -------------------
+// Drains each running deployment's remainingMs by REAL elapsed time, but ONLY
+// while the platform is serving: backend manager healthy, payment watcher fresh,
+// app instance actually alive. Otherwise the deployment is marked paused and its
+// clock FREEZES; it resumes on the first healthy tick. Supervisor downtime
+// freezes too: ticks simply don't happen while we're down, and loadState()
+// resets _lastTickAt on boot so the gap is never charged.
+const isMock = () => /^(1|true|on)$/i.test(process.env.MOCK_SPAWN || "");
+async function backendHealthy() {
+  if (isMock()) return true;
+  try { PROVISION_BACKEND === "vm" ? await vmHealth() : await mgrHealth(); return true; }
+  catch { return false; }
+}
+// vm backend: is this deployment's app instance still alive in the manager?
+// (the wasm-manager runs apps as subprocesses; a manager restart loses them)
+async function instanceAlive(rec) {
+  if (isMock() || PROVISION_BACKEND !== "vm") return true;  // worker backend: manager health is the best signal we have
+  if (!rec._vmId) return false;
+  const r = await vmReq("GET", `/vms/${encodeURIComponent(rec._vmId)}`, null, 5000).catch(() => null);
+  if (!r) return false;                        // manager unreachable mid-tick: freeze, don't respawn
+  return r.status === 200;
+}
+function pauseRec(rec, reason) {
+  if (!rec.paused || rec.pauseReason !== reason) {
+    console.warn(`[bill] ${rec.id} clock FROZEN (${reason})`);
+    rec.paused = true; rec.pauseReason = reason; saveStateSoon();
+  }
+  rec._lastTickAt = Date.now();                // downtime is never charged
+}
+function resumeRec(rec) {
+  if (rec.paused) {
+    console.log(`[bill] ${rec.id} clock resumed (${timeRemainingSec(rec) ?? "unlimited"}s left)`);
+    rec.paused = false; rec.pauseReason = null;
+    rec._lastTickAt = Date.now();              // bill from the moment of resume, not the frozen span
+    saveStateSoon();
+  }
+}
+// Respawn a still-funded app whose instance vanished (e.g. the manager container
+// restarted). Never marks the record failed - the user keeps their frozen
+// balance; retries back off so a broken image can't hammer the manager.
+async function respawnTenant(rec) {
+  if (rec._respawning || Date.now() < (rec._respawnAt || 0)) return false;
+  rec._respawning = true;
+  try {
+    const sp = await spawnContainer({ deploymentId: rec.id, gpu: rec._gpuSpec,
+      image: rec.image, share: rec.resources.share, appPort: rec.network.port, ports: rec.firewall });
+    rec._port = sp.internalPort; rec._sshPort = sp.sshPort;
+    if (sp.vmId) { rec._vmId = sp.vmId; rec._vmHostPort = sp.hostPort; }
+    if (sp.portMap) rec.portMap = sp.portMap;
+    rec._respawnAt = 0; rec._respawnBackoffMs = 0;
+    console.log(`[bill] ${rec.id} instance respawned after outage`);
+    return true;
+  } catch (e) {
+    rec._respawnBackoffMs = Math.min((rec._respawnBackoffMs || 15000) * 2, 300000);
+    rec._respawnAt = Date.now() + rec._respawnBackoffMs;
+    console.warn(`[bill] ${rec.id} respawn failed (${e.message}); retry in ${Math.round(rec._respawnBackoffMs / 1000)}s`);
+    return false;
+  } finally { rec._respawning = false; }
+}
+function startBillingTicker() {
   const t = setInterval(async () => {
     const now = Date.now();
+    const healthy = await backendHealthy();
+    const watcherOk = !FORWARDER_ADDRESS || (now - _lastPollOkAt) < WATCHER_STALE_SEC * 1000;
     for (const rec of deployments.values()) {
-      if (rec.status === "running" && rec.expiresAt && now > rec.expiresAt + GRACE_SEC * 1000) {
-        console.log(`[reaper] ${rec.id} expired ${Math.round((now - rec.expiresAt) / 1000)}s ago -> teardown`);
+      if (rec.status !== "running") continue;
+      if (!healthy)   { pauseRec(rec, "backend_down");  continue; }
+      if (!watcherOk) { pauseRec(rec, "watcher_stale"); continue; }
+      if (!(await instanceAlive(rec))) {
+        pauseRec(rec, "instance_missing");
+        if (await respawnTenant(rec)) resumeRec(rec);
+        continue;
+      }
+      resumeRec(rec);
+      if (rec.remainingMs == null) { rec._lastTickAt = now; continue; }   // unlimited (pilot)
+      // clamp so an event-loop stall or clock jump can't overcharge one tick
+      const elapsed = Math.min(Math.max(0, now - (rec._lastTickAt || now)), 2 * BILL_TICK_SEC * 1000);
+      rec._lastTickAt = now;
+      rec.remainingMs -= elapsed;
+      rec.consumedMs = (rec.consumedMs || 0) + elapsed;
+      saveStateSoon();
+      if (rec.remainingMs < -GRACE_SEC * 1000) {
+        console.log(`[reaper] ${rec.id} out of funded time -> teardown`);
         try { await stopContainer(rec); } catch {}
         if (rec._gpu) { releaseGpu(rec._gpu); rec._gpu = null; }
         rec.status = "expired";
       }
     }
-  }, 15000);
+    if (_stateDirty) saveStateNow();
+  }, BILL_TICK_SEC * 1000);
   if (t.unref) t.unref();
 }
 
@@ -1084,9 +1293,10 @@ app.delete("/v1/deployments/:id", authed, async (req, res) => {
   try { await stopContainer(rec); } catch {}
   if (rec._gpu) { releaseGpu(rec._gpu); rec._gpu = null; }
   rec.status = "stopping";
+  saveStateSoon();
   res.json({ id: rec.id, status: "stopping",
              paidUsdc: ((rec.paidUsdc || 0) / 1e6).toFixed(2),
-             ranSeconds: rec.startedAt ? Math.round((Date.now() - rec.startedAt) / 1000) : 0,
+             ranSeconds: Math.round((rec.consumedMs || 0) / 1000),
              note: "Pay-per-deploy: no balance is held, so unused funded time is forfeit on early stop." });
 });
 
@@ -1123,6 +1333,10 @@ app.use((_req, res) => fail(res, 404, "not_found", "No such route."));
 await initGpu();
 await initMps();
 await initSshHostKey();
+// restore persisted deployments/payment cursor BEFORE serving traffic or polling:
+// the downtime gap is frozen (never charged) and reservations shift by the gap.
+initStatePersistence();
+loadState();
 
 // ---------------------------------------------------------------------------
 // SSH TUNNEL - ssh rides the one attested origin as a WebSocket at /x/:id/ssh.
@@ -1203,6 +1417,7 @@ server.listen(PORT, () => console.log(`nan supervisor on :${PORT} · ${GPU_COUNT
 // advertise this enclave on-chain (opt-in, non-blocking, never fatal)
 registerOnChain();
 
-// pay-per-deploy: watch the forwarder for payments + reap expired deployments
+// pay-per-deploy: watch the forwarder for payments + fair-billing ticker (drains
+// funded time only while healthy; freezes through outages; reaps at -grace)
 startPaymentWatcher();
-startReaper();
+startBillingTicker();

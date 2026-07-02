@@ -3499,7 +3499,8 @@ function renderEnclaveRows(list, highlight){
   body.innerHTML = list.map(d => {
     const ep = d.network && d.network.endpoint, st = d.status || "\u2014";
     const bud = (d.paidUsdc != null)
-      ? (esc(d.paidUsdc) + " USDC paid" + (d.timeRemainingSec != null ? " · " + esc(fmtDur(d.timeRemainingSec)) + " left" : ""))
+      ? (esc(d.paidUsdc) + " USDC paid" + (d.timeRemainingSec != null ? " · " + esc(fmtDur(d.timeRemainingSec)) + " left" : "")
+         + (d.paused ? " · ⏸ time frozen (" + esc(d.pauseReason || "outage") + ", resumes when service is restored)" : ""))
       : "\u2014";
     const live = ["running", "provisioning", "queued", "pending"].indexOf(st) !== -1;
     return '<div class="enc-row' + (highlight && d.id === highlight ? " enc-new" : "") + '">' +

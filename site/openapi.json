@@ -1242,7 +1242,7 @@
               "null"
             ],
             "format": "date-time",
-            "description": "Funded through this time; extended by top-ups."
+            "description": "ESTIMATED wall-clock expiry (now + timeRemainingSec) while running and healthy; null when the clock is frozen (paused) or awaiting payment. The balance in timeRemainingSec is authoritative."
           },
           "digest": {
             "type": [
@@ -1269,8 +1269,19 @@
             "example": "10.00"
           },
           "timeRemainingSec": {
-            "type": "integer",
+            "type": ["integer", "null"],
+            "description": "Funded runtime balance in seconds (null = unlimited pilot deployment). Drains only while the platform is healthy; frozen (see paused) during outages, so it never shrinks while service is down.",
             "example": 21600
+          },
+          "paused": {
+            "type": "boolean",
+            "description": "True while the billing clock is FROZEN because the platform is not serving (enclave backend down, payment watcher blind, or the app instance is being respawned). Time resumes automatically when service is restored; users are never billed for downtime.",
+            "example": false
+          },
+          "pauseReason": {
+            "type": ["string", "null"],
+            "description": "Why the clock is frozen: backend_down | watcher_stale | instance_missing | restart_recovery.",
+            "example": null
           },
           "payment": {
             "$ref": "#/components/schemas/PaymentInstructions"

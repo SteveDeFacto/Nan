@@ -95,6 +95,14 @@ containers:
       # provision one deployment at a time. AUTO_PROVISION_HOURS=0 means no auto-expiry.
       - AUTO_PROVISION: ""
       - AUTO_PROVISION_HOURS: "0"
+    # fair-billing state (deployments, funded-time balances, payment-scan cursor).
+    # Persisting it means a supervisor restart FREEZES every deployment's clock and
+    # payment watching resumes where it stopped, instead of forfeiting paid time.
+    # NOTE: the ramdisk survives container restarts within one CVM boot, NOT a full
+    # CVM relaunch - a relaunch still starts fresh (payments made while fully down
+    # are re-scanned only within the persisted cursor's window).
+    volumes:
+      - /mnt/ramdisk/nan-state:/var/lib/nan
     secrets:
       - SECRET
       - ADMIN_TOKEN              # operator token for POST /v1/admin/deployments/:id/provision
